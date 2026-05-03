@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="en">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -16,10 +16,12 @@
     <main class="app-shell">
       <section class="assistant-panel">
         <p class="eyebrow">Financial App AI Assistant MVP</p>
-        <h1>用文本模拟语音，验证 App 内部动作调用链路。</h1>
+        <h1>Voice and text commands for an internal finance app.</h1>
         <p class="lead">
-          当前 demo 支持 3 个动作：记录支出、查看 profile、查看消费汇总。页面会同时展示
-          用户输入、发送给 Gemini 的 prompt、模型原始输出、规范化 JSON 和实际调用的内部函数。
+          Type English or Chinese commands. Voice input is English-only for better recognition.
+          The demo shows transcription, the Gemini
+          prompt, raw model output, normalized JSON, internal function calls, visible UI updates,
+          and optional Gemini TTS audio replies.
         </p>
 
         <form id="assistant-form" class="command-box">
@@ -27,24 +29,32 @@
             id="message-input"
             name="message"
             rows="3"
-            placeholder="例如：帮我记录一笔 12 欧的午饭支出"
+            placeholder="Example: Record a 12 euro lunch expense"
             autofocus
           ></textarea>
           <div class="command-actions">
-            <button type="submit">执行</button>
-            <button type="button" class="secondary" id="reset-button">重置 demo 数据</button>
+            <button type="submit">Run command</button>
+            <button type="button" class="secondary" id="record-button">Start voice input</button>
+            <button type="button" class="secondary" id="reset-button">Reset demo data</button>
           </div>
+          <label class="voice-toggle">
+            <input type="checkbox" id="speak-toggle" checked />
+            <span>Play Gemini TTS reply for text commands. Voice commands always reply with audio.</span>
+          </label>
+          <p class="voice-status" id="voice-status">Voice input is idle.</p>
         </form>
 
         <div class="examples" aria-label="Example prompts">
-          <button type="button" data-example="帮我记录一笔 12 欧的午饭支出">记录午饭支出</button>
-          <button type="button" data-example="查看我的 profile">查看 profile</button>
-          <button type="button" data-example="这个月我花了多少？">消费汇总</button>
+          <button type="button" data-example="Record a 12 euro lunch expense">Add expense</button>
+          <button type="button" data-example="Delete the 12 euro lunch expense">Delete expense</button>
+          <button type="button" data-example="Add a camera to my wishlist with a budget of 800 euros">Add wishlist item</button>
+          <button type="button" data-example="Show my wishlist">Show wishlist</button>
+          <button type="button" data-example="这个月我花了多少？">Chinese summary</button>
         </div>
 
         <section class="conversation" id="conversation" aria-live="polite">
           <div class="empty-state">
-            输入一句自然语言请求，验证：用户输入 → Gemini 结构化 JSON → App 函数执行。
+            Enter or record a command to verify: user input → Gemini JSON → internal app action.
           </div>
         </section>
       </section>
@@ -74,6 +84,11 @@
         <div class="card">
           <p class="card-label">Latest Expenses</p>
           <div class="expense-list" id="expense-list"></div>
+        </div>
+
+        <div class="card">
+          <p class="card-label">Wishlist</p>
+          <div class="wishlist-list" id="wishlist-list"></div>
         </div>
       </aside>
     </main>

@@ -28,7 +28,8 @@ body {
 }
 
 button,
-textarea {
+textarea,
+input {
   font: inherit;
 }
 
@@ -125,6 +126,7 @@ textarea {
 
 .command-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 12px;
   justify-content: flex-end;
   margin-top: 14px;
@@ -155,6 +157,22 @@ textarea {
   color: var(--moss-dark);
   background: rgba(102, 122, 72, 0.13);
   box-shadow: none;
+}
+
+.voice-toggle {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: fit-content;
+  margin-top: 14px;
+  color: var(--muted);
+  font-size: 0.92rem;
+}
+
+.voice-status {
+  margin: 10px 0 0;
+  color: var(--muted);
+  font-size: 0.9rem;
 }
 
 .examples {
@@ -216,6 +234,27 @@ textarea {
   color: var(--moss-dark);
   background: rgba(102, 122, 72, 0.12);
   font-weight: 700;
+}
+
+.result-message span {
+  color: var(--clay);
+}
+
+.assistant-audio {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 8px;
+  padding: 14px 16px;
+  border-radius: 16px;
+  background: rgba(200, 109, 78, 0.1);
+}
+
+.assistant-audio audio {
+  width: 100%;
+}
+
+.assistant-audio small {
+  color: var(--muted);
 }
 
 .warning {
@@ -319,13 +358,15 @@ pre {
 }
 
 .category-list,
-.expense-list {
+.expense-list,
+.wishlist-list {
   display: grid;
   gap: 10px;
 }
 
 .category-row,
-.expense-row {
+.expense-row,
+.wishlist-row {
   display: flex;
   justify-content: space-between;
   gap: 16px;
@@ -334,7 +375,9 @@ pre {
 }
 
 .expense-row small,
-.category-row span {
+.wishlist-row small,
+.category-row span,
+.wishlist-row span {
   color: var(--muted);
 }
 

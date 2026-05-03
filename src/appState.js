@@ -31,6 +31,19 @@ export function createInitialState() {
         date: "2026-05-02",
         createdAt: "2026-05-02T09:05:00.000Z"
       }
+    ],
+    wishlist: [
+      {
+        id: "wish_seed_001",
+        itemName: "Noise-cancelling headphones",
+        targetAmount: 180,
+        currency: "EUR",
+        priority: "medium",
+        dueDate: null,
+        note: "Compare prices before buying",
+        status: "planned",
+        createdAt: "2026-05-01T10:00:00.000Z"
+      }
     ]
   };
 }
@@ -41,6 +54,7 @@ export function resetAppState() {
   const initialState = createInitialState();
   appState.profile = initialState.profile;
   appState.expenses = initialState.expenses;
+  appState.wishlist = initialState.wishlist;
   return getAppSnapshot();
 }
 
@@ -48,6 +62,7 @@ export function getAppSnapshot() {
   return {
     profile: structuredClone(appState.profile),
     expenses: structuredClone(appState.expenses),
+    wishlist: structuredClone(appState.wishlist),
     summary: buildSpendingSummary(appState.expenses, appState.profile.baseCurrency)
   };
 }

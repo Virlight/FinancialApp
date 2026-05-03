@@ -1,98 +1,140 @@
 # Financial App AI Assistant MVP
 
-一个最小 demo，用网页输入模拟语音文本，验证链路：
+This is a local MVP for validating the core assistant chain:
 
-`用户输入 -> Gemini 结构化 JSON -> App 内部函数执行 -> 页面反馈`
+`voice/text input -> Gemini transcription or prompt -> structured JSON -> internal app function -> visible UI update -> optional Gemini TTS reply`
 
-## 支持的 App 动作
+The web UI is English-only. Text commands can be English or Chinese. Voice input is English-only for better recognition quality.
 
-- `create_expense`: 记录一笔支出。
-- `get_profile`: 查看 demo 用户 profile、余额、预算。
-- `get_spending_summary`: 查看消费汇总。
+## Supported App Actions
 
-## 启动和重启服务器
+- `create_expense`: record an expense.
+- `delete_expense`: delete a matching expense by id or natural-language selectors such as amount, category, or note.
+- `get_profile`: show the demo user profile, balance, and budget.
+- `get_spending_summary`: show spending totals and category breakdowns.
+- `create_wishlist_item`: create a purchase plan or wishlist item.
+- `get_wishlist`: list planned wishlist items.
 
-首次启动：
+## First-Time Setup
 
 ```bash
+cd /Users/haoliang/Projects/FinancialApp
 npm install
 cp .env.example .env
-npm run dev
 ```
 
-打开 `http://localhost:3000`。
-
-如果已经启动过服务，但页面没有显示最新代码或 `.env` 刚改过，需要重启服务器：
-
-```bash
-# 在正在运行 npm run dev 的终端里按 Ctrl+C 停止
-npm run dev
-```
-
-如果找不到之前运行服务的终端，或者看到 `port 3000 already in use`，先查占用端口的进程：
-
-```bash
-lsof -nP -iTCP:3000 -sTCP:LISTEN
-```
-
-然后停止对应的 PID：
-
-```bash
-kill <PID>
-npm run dev
-```
-
-什么时候必须重启：
-
-- 改了 `.env`，例如 `GEMINI_API_KEY` 或 `GEMINI_MODEL`。
-- 当前页面还在使用 `mock`，但你确认 `.env` 已经有 Gemini key。
-- 端口 3000 上跑的是旧进程。
-
-什么时候不一定要重启：
-
-- 只改了 `public/` 里的前端文件，通常刷新浏览器即可。
-- 用 `npm run dev` 启动时，改 `src/` 后端文件通常会被 Node watch 自动重启。
-
-如果没有配置 `GEMINI_API_KEY`，后端会自动使用本地 mock parser，方便先验证端到端链路。配置 Gemini 后，会使用 `@google/genai` 的 structured output 生成固定 JSON schema。
-
-`.env` 示例：
+Edit `.env` and set your Gemini API key:
 
 ```bash
 GEMINI_API_KEY=your_api_key_here
 GEMINI_MODEL=gemini-2.5-flash
+GEMINI_TRANSCRIPTION_MODEL=gemini-3-flash-preview
+GEMINI_TTS_MODEL=gemini-3.1-flash-tts-preview
+GEMINI_TTS_VOICE=Iapetus
 PORT=3000
 ```
 
-## Debug 流程
+Start the local server:
 
-页面每次执行都会展示完整链路：
-
-```text
-1. User Input
-2. Prompt Sent To Gemini
-3. Expected Model Output Contract
-4. Raw Model Output
-5. Normalized Intent JSON
-6. App Function Call
+```bash
+npm run dev
 ```
 
-也可以直接调接口查看同样的 debug 数据：
+Open:
+
+```text
+http://localhost:3000
+```
+
+## Restarting The Server
+
+Restart after changing `.env`, changing model names, or if the page still shows `mock`.
+
+If the server terminal is visible:
+
+```bash
+# Press Ctrl+C in the terminal running npm run dev
+npm run dev
+```
+
+If port 3000 is already occupied:
+
+```bash
+lsof -nP -iTCP:3000 -sTCP:LISTEN
+kill <PID>
+npm run dev
+```
+
+You usually do not need a manual restart after editing `src/` while using `npm run dev`, because Node watch restarts automatically. If you only edit `public/`, refresh the browser.
+
+## Voice Input And Voice Output
+
+Voice input flow:
+
+```text
+English microphone recording -> browser encodes WAV -> /api/transcribe -> Gemini transcript -> /api/assistant -> app action
+```
+
+Voice output flow:
+
+```text
+app result text -> Gemini TTS -> WAV audio -> browser audio player
+```
+
+Text commands use the `Play Gemini TTS reply` checkbox. Voice commands send `inputMode: "voice"` to `/api/assistant`, and the backend always requests a Gemini TTS audio reply after the app action finishes. Non-English voice input is rejected before intent parsing instead of being translated.
+
+Default speech models:
+
+```text
+Voice transcription: gemini-3-flash-preview
+TTS: gemini-3.1-flash-tts-preview
+TTS fallback: gemini-2.5-flash-preview-tts
+Voice: Iapetus
+```
+
+The microphone works on `localhost` because browsers treat it as a secure origin. The implementation is not real-time streaming; it records a short command, then transcribes after you stop recording.
+
+## Debug Flow
+
+Each command displays:
+
+```text
+0. Voice Transcription        Only shown for microphone input
+1. User Input                 The final text command
+2. Prompt Sent To Gemini      The full intent-parsing prompt
+3. Expected Model Output Contract
+4. Raw Model Output           Gemini's raw JSON text
+5. Normalized Intent JSON     App-cleaned JSON
+6. App Function Call          Internal function name and arguments
+7. Gemini TTS Debug           Only shown when TTS succeeds
+```
+
+You can also inspect the API directly:
 
 ```bash
 curl -s -X POST http://localhost:3000/api/assistant \
   -H 'Content-Type: application/json' \
-  -d '{"message":"帮我记录一笔 12 欧的午饭支出"}'
+  -d '{"message":"Record a 12 euro lunch expense","speak":true}'
 ```
 
-## 示例输入
+## Example Commands
 
 ```text
+Record a 12 euro lunch expense
+Delete the 12 euro lunch expense
+Show my profile
+How much did I spend this month?
+How much did I spend on transport this month?
+Summarize my current financial situation
+Add a camera to my wishlist with a budget of 800 euros
+Show my wishlist
 帮我记录一笔 12 欧的午饭支出
-查看我的 profile
-这个月我花了多少？
+总结一下当前我的支出情况
+我的本月交通花费是多少
+查看我的购买计划
 ```
 
-## 测试
+## Tests
 
 ```bash
 npm test

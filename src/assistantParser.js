@@ -136,8 +136,41 @@ Supported internal app actions:
 3. get_spending_summary
    Use this when the user asks for spending summary, total spending, category breakdown, or how much was spent.
    period should be today, current_week, current_month, or all_time. Default to current_month when unclear.
+   If the user asks about a specific category, set category too.
+   Examples:
+   - "How much did I spend on transport this month?" means category transport, period current_month.
+   - "我的本月交通花费是多少" means category transport, period current_month.
 
-4. unsupported
+4. delete_expense
+   Use this when the user asks to remove or delete an existing expense.
+   Prefer expenseId if the user gives an id. Otherwise set selectors like amount, category, and note.
+   Examples:
+   - "delete the 12 euro lunch expense" means amount 12, currency EUR, category food, note lunch.
+   - "删除咖啡那笔支出" means category food, note coffee.
+   - "remove my latest transport expense" means category transport, note null.
+
+5. create_wishlist_item
+   Use this when the user asks to create a purchase plan, savings plan for an item, or wishlist item.
+   itemName is required. targetAmount is the intended price or budget when present.
+   priority should be low, medium, or high. Default to medium when unclear.
+   Examples:
+   - "Add a MacBook to my wishlist with a budget of 1200 euros" means itemName MacBook, targetAmount 1200, currency EUR.
+   - "帮我计划买一台 800 欧的相机" means itemName camera, targetAmount 800, currency EUR.
+
+6. get_wishlist
+   Use this when the user asks to view, list, check, or calculate purchase plans or wishlist items.
+   If the user asks for wishlist amount, wishlist total, purchase plan budget, or planned purchase cost, use this intent.
+   Examples: "show my wishlist", "what's my wishlist amount?", "wishlist total", "查看我的购买计划".
+
+7. get_financial_overview
+   Use this when the user asks for an overall summary, current financial situation, or a broad recap.
+   The app will combine balance, spending summary, category breakdown, latest expenses, and wishlist.
+   Examples:
+   - "Summarize my current financial situation"
+   - "总结一下当前我的支出情况"
+   - "Give me a full overview"
+
+8. unsupported
    Use this for transfers, investments, payments, loans, or anything outside this MVP.
 
 Rules:
@@ -146,6 +179,7 @@ Rules:
 - Use USD when user says dollar, dollars, or $.
 - Translate common Chinese finance phrases into the schema values.
 - For irrelevant fields, output null.
+- Always include all fields required by the schema, even when their value is null.
 - confidence should be between 0 and 1.
 
 User input:
@@ -157,6 +191,55 @@ function parseWithMockRules(input) {
   const lowerInput = input.toLowerCase();
   const amount = extractAmount(input);
   const currency = extractCurrency(input);
+
+  if (
+    looksLikeWishlistRequest(lowerInput) &&
+    !looksLikeWishlistCreateRequest(lowerInput) &&
+    (looksLikeListRequest(lowerInput) || looksLikeWishlistAmountQuestion(lowerInput))
+  ) {
+    return baseIntent({
+      intent: "get_wishlist",
+      note: "wishlist request",
+      confidence: 0.76
+    });
+  }
+
+  if (looksLikeOverviewRequest(lowerInput)) {
+    return baseIntent({
+      intent: "get_financial_overview",
+      note: "financial overview request",
+      period: extractPeriod(lowerInput),
+      confidence: 0.8
+    });
+  }
+
+  if (looksLikeWishlistRequest(lowerInput)) {
+    const itemName = extractWishlistItemName(input);
+
+    return baseIntent({
+      intent: "create_wishlist_item",
+      itemName,
+      targetAmount: amount,
+      currency: currency || (amount === null ? null : "EUR"),
+      priority: extractPriority(lowerInput),
+      note: "purchase plan",
+      confidence: 0.7
+    });
+  }
+
+  if (looksLikeDeleteRequest(lowerInput)) {
+    const category = extractCategory(lowerInput);
+    const note = extractNote(lowerInput, category);
+
+    return baseIntent({
+      intent: "delete_expense",
+      amount,
+      currency,
+      category,
+      note: note === "other" ? null : note,
+      confidence: 0.68
+    });
+  }
 
   if (looksLikeProfileRequest(lowerInput)) {
     return baseIntent({
@@ -171,6 +254,7 @@ function parseWithMockRules(input) {
       intent: "get_spending_summary",
       note: "spending summary request",
       period: extractPeriod(lowerInput),
+      category: extractSpecificCategory(lowerInput),
       confidence: 0.78
     });
   }
@@ -205,6 +289,11 @@ function baseIntent(overrides) {
     note: null,
     period: null,
     date: null,
+    expenseId: null,
+    itemName: null,
+    targetAmount: null,
+    priority: null,
+    dueDate: null,
     confidence: 0,
     ...overrides
   };
@@ -248,6 +337,30 @@ function looksLikeSummaryRequest(input) {
   return /(summary|summarize|统计|总结|汇总|花了多少|消费多少|支出多少|支出情况|消费情况|本月.*花|这个月.*花)/i.test(input);
 }
 
+function looksLikeOverviewRequest(input) {
+  return /(overview|full summary|financial situation|current situation|整体|总览|全面|总结一下当前|当前.*情况|财务状况)/i.test(input);
+}
+
+function looksLikeDeleteRequest(input) {
+  return /(delete|remove|cancel|删除|删掉|移除|取消).*(expense|spending|支出|消费|那笔|记录)|^(delete|remove|删除|删掉)/i.test(input);
+}
+
+function looksLikeWishlistRequest(input) {
+  return /(wishlist|wish list|purchase plan|buying plan|want to buy|plan to buy|save for|愿望清单|心愿单|购买计划|计划买|想买|攒钱买)/i.test(input);
+}
+
+function looksLikeWishlistCreateRequest(input) {
+  return /(\badd\b|\bcreate\b|\bplan\b|\bsave for\b|\bwant to buy\b|\bplan to buy\b|加入|添加|新增|计划买|想买|攒钱买)/i.test(input);
+}
+
+function looksLikeWishlistAmountQuestion(input) {
+  return /(amount|total|cost|budget|how much|多少钱|金额|总额|预算)/i.test(input);
+}
+
+function looksLikeListRequest(input) {
+  return /(\bshow\b|\bview\b|\blist\b|\bcheck\b|查看|看看|列出|显示)/i.test(input);
+}
+
 function looksLikeExpenseRequest(input) {
   return /(记录|记一笔|支出|花了|消费|买了|spent|expense|paid|cost|lunch|coffee|dinner|breakfast|午饭|午餐|晚饭|早餐|咖啡)/i.test(input);
 }
@@ -257,7 +370,7 @@ function extractCategory(input) {
     return "food";
   }
 
-  if (/(地铁|公交|火车|出租|uber|taxi|transport|transit|train|bus)/i.test(input)) {
+  if (/(交通|通勤|地铁|公交|火车|出租|uber|taxi|transport|transit|train|bus)/i.test(input)) {
     return "transport";
   }
 
@@ -288,6 +401,11 @@ function extractCategory(input) {
   return "other";
 }
 
+function extractSpecificCategory(input) {
+  const category = extractCategory(input);
+  return category === "other" ? null : category;
+}
+
 function extractNote(input, category) {
   if (/(午饭|午餐|lunch)/i.test(input)) {
     return "lunch";
@@ -306,6 +424,27 @@ function extractNote(input, category) {
   }
 
   return category;
+}
+
+function extractPriority(input) {
+  if (/(high|urgent|important|高优先级|重要)/i.test(input)) {
+    return "high";
+  }
+
+  if (/(low|not urgent|低优先级|不急)/i.test(input)) {
+    return "low";
+  }
+
+  return "medium";
+}
+
+function extractWishlistItemName(input) {
+  const normalized = input
+    .replace(/\d+(?:[.,]\d{1,2})?/g, "")
+    .replace(/(euros?|eur|€|欧元?|dollars?|usd|\$|美元|wishlist|wish list|purchase plan|buying plan|计划买|想买|愿望清单|心愿单|购买计划|帮我|add|create|with|budget|of|for|to my|a|an|the)/gi, " ")
+    .trim();
+
+  return normalized || "planned purchase";
 }
 
 function extractPeriod(input) {

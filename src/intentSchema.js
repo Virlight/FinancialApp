@@ -1,7 +1,11 @@
 export const supportedIntents = [
   "create_expense",
+  "delete_expense",
+  "create_wishlist_item",
+  "get_wishlist",
   "get_profile",
   "get_spending_summary",
+  "get_financial_overview",
   "unsupported"
 ];
 
@@ -26,6 +30,8 @@ export const supportedPeriods = [
   "all_time"
 ];
 
+export const supportedPriorities = ["low", "medium", "high"];
+
 export const intentJsonSchema = {
   type: "object",
   properties: {
@@ -48,7 +54,7 @@ export const intentJsonSchema = {
     },
     note: {
       type: ["string", "null"],
-      description: "Short user-facing note for the action, such as lunch."
+      description: "Short user-facing note for the action, such as lunch. Also used as a delete selector when the user references an expense by description."
     },
     period: {
       type: ["string", "null"],
@@ -57,6 +63,26 @@ export const intentJsonSchema = {
     date: {
       type: ["string", "null"],
       description: "ISO date YYYY-MM-DD if the user mentions a date, otherwise null."
+    },
+    expenseId: {
+      type: ["string", "null"],
+      description: "Expense id to delete when the user explicitly references an id, otherwise null."
+    },
+    itemName: {
+      type: ["string", "null"],
+      description: "Wishlist or purchase plan item name."
+    },
+    targetAmount: {
+      type: ["number", "null"],
+      description: "Target price or budget for a wishlist item."
+    },
+    priority: {
+      type: ["string", "null"],
+      description: "Wishlist item priority: low, medium, or high."
+    },
+    dueDate: {
+      type: ["string", "null"],
+      description: "ISO date YYYY-MM-DD for a wishlist or purchase plan target date, otherwise null."
     },
     confidence: {
       type: "number",
@@ -73,6 +99,11 @@ export const intentJsonSchema = {
     "note",
     "period",
     "date",
+    "expenseId",
+    "itemName",
+    "targetAmount",
+    "priority",
+    "dueDate",
     "confidence"
   ],
   additionalProperties: false
@@ -95,6 +126,20 @@ export function normalizeIntent(rawIntent) {
     note: typeof intent.note === "string" && intent.note.trim() ? intent.note.trim() : null,
     period: normalizePeriod(intent.period),
     date: normalizeDate(intent.date),
+    expenseId:
+      typeof intent.expenseId === "string" && intent.expenseId.trim()
+        ? intent.expenseId.trim()
+        : null,
+    itemName:
+      typeof intent.itemName === "string" && intent.itemName.trim()
+        ? intent.itemName.trim()
+        : null,
+    targetAmount:
+      typeof intent.targetAmount === "number" && Number.isFinite(intent.targetAmount)
+        ? intent.targetAmount
+        : null,
+    priority: normalizePriority(intent.priority),
+    dueDate: normalizeDate(intent.dueDate),
     confidence:
       typeof intent.confidence === "number" && Number.isFinite(intent.confidence)
         ? Math.max(0, Math.min(1, intent.confidence))
@@ -119,6 +164,22 @@ export function validateIntent(intent) {
     }
   }
 
+  if (intent.intent === "delete_expense") {
+    if (!intent.expenseId && !intent.note && !intent.category && !intent.amount) {
+      errors.push("delete_expense requires an expense id or at least one selector.");
+    }
+  }
+
+  if (intent.intent === "create_wishlist_item") {
+    if (!intent.itemName) {
+      errors.push("create_wishlist_item requires an item name.");
+    }
+
+    if (intent.targetAmount !== null && intent.targetAmount <= 0) {
+      errors.push("create_wishlist_item targetAmount must be positive when provided.");
+    }
+  }
+
   if (intent.currency && !supportedCurrencies.includes(intent.currency)) {
     errors.push(`Unsupported currency: ${intent.currency}`);
   }
@@ -129,6 +190,10 @@ export function validateIntent(intent) {
 
   if (intent.period && !supportedPeriods.includes(intent.period)) {
     errors.push(`Unsupported period: ${intent.period}`);
+  }
+
+  if (intent.priority && !supportedPriorities.includes(intent.priority)) {
+    errors.push(`Unsupported priority: ${intent.priority}`);
   }
 
   return {
@@ -185,4 +250,13 @@ function normalizeDate(date) {
 
   const value = date.trim();
   return /^\d{4}-\d{2}-\d{2}$/.test(value) ? value : null;
+}
+
+function normalizePriority(priority) {
+  if (typeof priority !== "string" || !priority.trim()) {
+    return null;
+  }
+
+  const value = priority.trim().toLowerCase();
+  return supportedPriorities.includes(value) ? value : "medium";
 }
