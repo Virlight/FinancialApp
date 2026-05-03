@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Financial App Voice Assistant MVP</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,600;9..144,800&family=Noto+Sans+SC:wght@400;500;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="assistant-panel">
+        <p class="eyebrow">Financial App AI Assistant MVP</p>
+        <h1>用文本模拟语音，验证 App 内部动作调用链路。</h1>
+        <p class="lead">
+          当前 demo 支持 3 个动作：记录支出、查看 profile、查看消费汇总。页面会同时展示
+          用户输入、发送给 Gemini 的 prompt、模型原始输出、规范化 JSON 和实际调用的内部函数。
+        </p>
+
+        <form id="assistant-form" class="command-box">
+          <textarea
+            id="message-input"
+            name="message"
+            rows="3"
+            placeholder="例如：帮我记录一笔 12 欧的午饭支出"
+            autofocus
+          ></textarea>
+          <div class="command-actions">
+            <button type="submit">执行</button>
+            <button type="button" class="secondary" id="reset-button">重置 demo 数据</button>
+          </div>
+        </form>
+
+        <div class="examples" aria-label="Example prompts">
+          <button type="button" data-example="帮我记录一笔 12 欧的午饭支出">记录午饭支出</button>
+          <button type="button" data-example="查看我的 profile">查看 profile</button>
+          <button type="button" data-example="这个月我花了多少？">消费汇总</button>
+        </div>
+
+        <section class="conversation" id="conversation" aria-live="polite">
+          <div class="empty-state">
+            输入一句自然语言请求，验证：用户输入 → Gemini 结构化 JSON → App 函数执行。
+          </div>
+        </section>
+      </section>
+
+      <aside class="profile-panel">
+        <div class="card profile-card">
+          <p class="card-label">Demo Profile</p>
+          <h2 id="profile-name">-</h2>
+          <div class="metric-grid">
+            <div>
+              <span>Balance</span>
+              <strong id="profile-balance">-</strong>
+            </div>
+            <div>
+              <span>Monthly Budget</span>
+              <strong id="profile-budget">-</strong>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <p class="card-label">Current Month Spending</p>
+          <div class="spend-total" id="summary-total">-</div>
+          <div class="category-list" id="category-list"></div>
+        </div>
+
+        <div class="card">
+          <p class="card-label">Latest Expenses</p>
+          <div class="expense-list" id="expense-list"></div>
+        </div>
+      </aside>
+    </main>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
