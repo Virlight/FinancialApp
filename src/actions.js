@@ -1,65 +1,92 @@
 import { appState, buildSpendingSummary, getAppSnapshot, roundMoney } from "./appState.js";
-import { validateIntent } from "./intentSchema.js";
+import { sendEmail } from "./email.js";
+import { normalizeFunctionCall, validateFunctionCall } from "./functionSchema.js";
+import { lookupStoreProduct } from "./retailSearch.js";
+import { lookupRetailOffers } from "./retailOffers/lookupRetailOffers.js";
+import { lookupLocalDeals } from "./localDeals/lookupLocalDeals.js";
 
-export function executeAssistantIntent(intent) {
-  const validation = validateIntent(intent);
+export async function executeAssistantFunctionCall(rawFunctionCall) {
+  const functionCall = normalizeFunctionCall(rawFunctionCall);
+  const validation = validateFunctionCall(functionCall);
 
   if (!validation.ok) {
     return {
       executedAction: {
-        functionName: "reject_intent",
+        functionName: "reject_function_call",
         arguments: {
+          functionName: functionCall.name,
+          args: functionCall.args,
           errors: validation.errors
         }
       },
       result: {
         ok: false,
-        message: "I could not execute this request because the parsed JSON is incomplete.",
+        message: "I could not execute this request because the function call is incomplete.",
         errors: validation.errors
       },
       state: getAppSnapshot()
     };
   }
 
-  if (intent.intent === "create_expense") {
-    return createExpense(intent);
+  if (functionCall.name === "create_expense") {
+    return createExpense(functionCall.args);
   }
 
-  if (intent.intent === "delete_expense") {
-    return deleteExpense(intent);
+  if (functionCall.name === "delete_expense") {
+    return deleteExpense(functionCall.args);
   }
 
-  if (intent.intent === "create_wishlist_item") {
-    return createWishlistItem(intent);
+  if (functionCall.name === "create_wishlist_item") {
+    return createWishlistItem(functionCall.args);
   }
 
-  if (intent.intent === "get_wishlist") {
+  if (functionCall.name === "get_wishlist") {
     return getWishlist();
   }
 
-  if (intent.intent === "get_profile") {
+  if (functionCall.name === "send_email") {
+    return sendEmailAction(functionCall.args);
+  }
+
+  if (functionCall.name === "lookup_store_product") {
+    return lookupStoreProductAction(functionCall.args);
+  }
+
+  if (functionCall.name === "lookup_retail_offers") {
+    return lookupRetailOffersAction(functionCall.args);
+  }
+
+  if (functionCall.name === "lookup_local_deals") {
+    return lookupLocalDealsAction(functionCall.args);
+  }
+
+  if (functionCall.name === "update_profile") {
+    return updateProfile(functionCall.args);
+  }
+
+  if (functionCall.name === "get_profile") {
     return getProfile();
   }
 
-  if (intent.intent === "get_spending_summary") {
-    return getSpendingSummary(intent);
+  if (functionCall.name === "get_spending_summary") {
+    return getSpendingSummary(functionCall.args);
   }
 
-  if (intent.intent === "get_financial_overview") {
-    return getFinancialOverview(intent);
+  if (functionCall.name === "get_financial_overview") {
+    return getFinancialOverview(functionCall.args);
   }
 
-  return unsupported(intent);
+  return unsupported(functionCall.args);
 }
 
-function createExpense(intent) {
+function createExpense(args) {
   const expense = {
     id: `exp_${Date.now()}`,
-    amount: roundMoney(intent.amount),
-    currency: intent.currency || appState.profile.baseCurrency,
-    category: intent.category || "other",
-    note: intent.note || "expense",
-    date: intent.date || new Date().toISOString().slice(0, 10),
+    amount: roundMoney(args.amount),
+    currency: args.currency || appState.profile.baseCurrency,
+    category: args.category || "other",
+    note: args.note || "expense",
+    date: args.date || new Date().toISOString().slice(0, 10),
     createdAt: new Date().toISOString()
   };
 
@@ -89,14 +116,14 @@ function createExpense(intent) {
   };
 }
 
-function deleteExpense(intent) {
-  const expenseIndex = findExpenseIndex(intent);
+function deleteExpense(args) {
+  const expenseIndex = findExpenseIndex(args);
 
   if (expenseIndex === -1) {
     return {
       executedAction: {
         functionName: "delete_expense",
-        arguments: buildDeleteExpenseArguments(intent)
+        arguments: buildDeleteExpenseArguments(args)
       },
       result: {
         ok: false,
@@ -118,7 +145,7 @@ function deleteExpense(intent) {
     executedAction: {
       functionName: "delete_expense",
       arguments: {
-        ...buildDeleteExpenseArguments(intent),
+        ...buildDeleteExpenseArguments(args),
         deletedExpenseId: deletedExpense.id
       }
     },
@@ -131,15 +158,15 @@ function deleteExpense(intent) {
   };
 }
 
-function createWishlistItem(intent) {
+function createWishlistItem(args) {
   const item = {
     id: `wish_${Date.now()}`,
-    itemName: intent.itemName,
-    targetAmount: intent.targetAmount === null ? null : roundMoney(intent.targetAmount),
-    currency: intent.currency || appState.profile.baseCurrency,
-    priority: intent.priority || "medium",
-    dueDate: intent.dueDate,
-    note: intent.note,
+    itemName: args.itemName,
+    targetAmount: args.targetAmount === undefined ? null : roundMoney(args.targetAmount),
+    currency: args.currency || appState.profile.baseCurrency,
+    priority: args.priority || "medium",
+    dueDate: args.dueDate,
+    note: args.note,
     status: "planned",
     createdAt: new Date().toISOString()
   };
@@ -197,6 +224,290 @@ function getWishlist() {
   };
 }
 
+async function sendEmailAction(args) {
+  const recipientEmails = args.recipientEmails?.length
+    ? args.recipientEmails
+    : [args.recipientEmail].filter(Boolean);
+  const recipientLabel = formatRecipients(recipientEmails);
+  const emailArguments = {
+    recipientEmail: args.recipientEmail || recipientEmails[0],
+    recipientEmails,
+    emailSubject: args.emailSubject,
+    emailBody: args.emailBody
+  };
+
+  try {
+    const emailResult = await sendEmail({
+      to: recipientEmails,
+      subject: args.emailSubject,
+      body: args.emailBody
+    });
+    const emailLogEntry = createEmailLogEntry(args, emailResult);
+
+    appState.emailLog.unshift(emailLogEntry);
+
+    return {
+      executedAction: {
+        functionName: "send_email",
+        arguments: emailArguments
+      },
+      result: {
+        ok: emailResult.ok,
+        message: emailResult.ok
+          ? emailResult.dryRun
+            ? `Prepared email to ${recipientLabel}. Dry run is enabled, so no email was sent.`
+            : `Sent email to ${recipientLabel}.`
+          : emailResult.message,
+        email: emailLogEntry,
+        providerResult: emailResult
+      },
+      state: getAppSnapshot()
+    };
+  } catch (error) {
+    const emailLogEntry = createEmailLogEntry(args, {
+      ok: false,
+      dryRun: false,
+      provider: process.env.EMAIL_PROVIDER || "gmail",
+      message: error.message
+    });
+
+    appState.emailLog.unshift(emailLogEntry);
+
+    return {
+      executedAction: {
+        functionName: "send_email",
+        arguments: emailArguments
+      },
+      result: {
+        ok: false,
+        message: `Email sending failed: ${error.message}`,
+        email: emailLogEntry
+      },
+      state: getAppSnapshot()
+    };
+  }
+}
+
+async function lookupStoreProductAction(args) {
+  const retailArguments = {
+    productQuery: args.productQuery,
+    retailers: args.retailers,
+    location: args.location,
+    lookupType: args.lookupType,
+    date: args.date
+  };
+
+  try {
+    const retailResult = await lookupStoreProduct(args);
+
+    return {
+      executedAction: {
+        functionName: "lookup_store_product",
+        arguments: retailArguments
+      },
+      result: {
+        ok: retailResult.ok,
+        message: retailResult.ok ? retailResult.answer : retailResult.message,
+        retailSearch: retailResult,
+        mapPlaces: retailResult.mapPlaces || []
+      },
+      state: getAppSnapshot()
+    };
+  } catch (error) {
+    return {
+      executedAction: {
+        functionName: "lookup_store_product",
+        arguments: retailArguments
+      },
+      result: {
+        ok: false,
+        message: `Retail product lookup failed: ${error.message}`,
+        retailSearch: {
+          ok: false,
+          request: retailArguments,
+          message: error.message
+        }
+      },
+      state: getAppSnapshot()
+    };
+  }
+}
+
+async function lookupRetailOffersAction(args) {
+  const offerArguments = {
+    retailers: args.retailers,
+    location: args.location,
+    period: args.period,
+    date: args.date
+  };
+
+  try {
+    const offerResult = await lookupRetailOffers(args);
+
+    return {
+      executedAction: {
+        functionName: "lookup_retail_offers",
+        arguments: offerArguments
+      },
+      result: {
+        ok: offerResult.ok,
+        message: offerResult.ok ? offerResult.answer : offerResult.message,
+        retailOffers: offerResult,
+        mapPlaces: offerResult.mapPlaces || []
+      },
+      state: getAppSnapshot()
+    };
+  } catch (error) {
+    return {
+      executedAction: {
+        functionName: "lookup_retail_offers",
+        arguments: offerArguments
+      },
+      result: {
+        ok: false,
+        message: `Retail offers lookup failed: ${error.message}`,
+        retailOffers: {
+          ok: false,
+          request: offerArguments,
+          message: error.message
+        }
+      },
+      state: getAppSnapshot()
+    };
+  }
+}
+
+async function lookupLocalDealsAction(args) {
+  const localDealArguments = {
+    merchantQuery: args.merchantQuery,
+    productQuery: args.productQuery,
+    category: args.category,
+    location: args.location,
+    period: args.period,
+    date: args.date
+  };
+
+  try {
+    const localDealResult = await lookupLocalDeals(args);
+
+    return {
+      executedAction: {
+        functionName: "lookup_local_deals",
+        arguments: localDealArguments
+      },
+      result: {
+        ok: localDealResult.ok,
+        message: localDealResult.ok ? localDealResult.answer : localDealResult.message,
+        localDeals: localDealResult,
+        mapPlaces: localDealResult.mapPlaces || []
+      },
+      state: getAppSnapshot()
+    };
+  } catch (error) {
+    return {
+      executedAction: {
+        functionName: "lookup_local_deals",
+        arguments: localDealArguments
+      },
+      result: {
+        ok: false,
+        message: `Local deal lookup failed: ${error.message}`,
+        localDeals: {
+          ok: false,
+          request: localDealArguments,
+          message: error.message
+        }
+      },
+      state: getAppSnapshot()
+    };
+  }
+}
+
+function updateProfile(args) {
+  const before = getAppSnapshot().profile;
+  const changes = {};
+
+  if (args.name !== undefined) {
+    appState.profile.name = args.name;
+    changes.name = {
+      from: before.name,
+      to: appState.profile.name
+    };
+  }
+
+  if (args.baseCurrency !== undefined) {
+    appState.profile.baseCurrency = args.baseCurrency;
+    changes.baseCurrency = {
+      from: before.baseCurrency,
+      to: appState.profile.baseCurrency
+    };
+  }
+
+  if (args.currentBalance !== undefined) {
+    appState.profile.currentBalance = roundMoney(args.currentBalance);
+    changes.currentBalance = {
+      from: before.currentBalance,
+      to: appState.profile.currentBalance
+    };
+  }
+
+  if (args.monthlyIncome !== undefined) {
+    appState.profile.monthlyIncome = roundMoney(args.monthlyIncome);
+    changes.monthlyIncome = {
+      from: before.monthlyIncome,
+      to: appState.profile.monthlyIncome
+    };
+  }
+
+  if (args.monthlyBudget !== undefined) {
+    appState.profile.monthlyBudget = roundMoney(args.monthlyBudget);
+    changes.monthlyBudget = {
+      from: before.monthlyBudget,
+      to: appState.profile.monthlyBudget
+    };
+  }
+
+  if (args.savingsGoalName !== undefined) {
+    appState.profile.savingsGoal.name = args.savingsGoalName;
+    changes.savingsGoalName = {
+      from: before.savingsGoal.name,
+      to: appState.profile.savingsGoal.name
+    };
+  }
+
+  if (args.savingsGoalTargetAmount !== undefined) {
+    appState.profile.savingsGoal.targetAmount = roundMoney(args.savingsGoalTargetAmount);
+    changes.savingsGoalTargetAmount = {
+      from: before.savingsGoal.targetAmount,
+      to: appState.profile.savingsGoal.targetAmount
+    };
+  }
+
+  if (args.savingsGoalSavedAmount !== undefined) {
+    appState.profile.savingsGoal.savedAmount = roundMoney(args.savingsGoalSavedAmount);
+    changes.savingsGoalSavedAmount = {
+      from: before.savingsGoal.savedAmount,
+      to: appState.profile.savingsGoal.savedAmount
+    };
+  }
+
+  const snapshot = getAppSnapshot();
+
+  return {
+    executedAction: {
+      functionName: "update_profile",
+      arguments: args
+    },
+    result: {
+      ok: true,
+      message: `Updated profile: ${formatProfileChanges(changes, snapshot.profile.baseCurrency)}`,
+      profile: snapshot.profile,
+      changes
+    },
+    state: snapshot
+  };
+}
+
 function getProfile() {
   const snapshot = getAppSnapshot();
 
@@ -210,10 +521,13 @@ function getProfile() {
       message: `${snapshot.profile.name}'s balance is ${formatMoney(
         snapshot.profile.currentBalance,
         snapshot.profile.baseCurrency
-      )}. Current month spending is ${formatMoney(
-        snapshot.summary.total,
-        snapshot.summary.currency
-      )}.`,
+      )}. Monthly income is ${formatMoney(
+        snapshot.profile.monthlyIncome,
+        snapshot.profile.baseCurrency
+      )}. Monthly budget is ${formatMoney(
+        snapshot.profile.monthlyBudget,
+        snapshot.profile.baseCurrency
+      )}. Current month spending is ${formatMoney(snapshot.summary.total, snapshot.summary.currency)}.`,
       profile: snapshot.profile,
       summary: snapshot.summary
     },
@@ -221,13 +535,13 @@ function getProfile() {
   };
 }
 
-function getSpendingSummary(intent) {
-  const period = intent.period || "current_month";
+function getSpendingSummary(args) {
+  const period = args.period || "current_month";
   const summary = buildSpendingSummary(appState.expenses, appState.profile.baseCurrency, period);
-  const categoryAmount = intent.category ? summary.byCategory[intent.category] || 0 : null;
+  const categoryAmount = args.category ? summary.byCategory[args.category] || 0 : null;
   const budgetRemaining = roundMoney(appState.profile.monthlyBudget - summary.total);
-  const message = intent.category
-    ? `You spent ${formatMoney(categoryAmount, summary.currency)} on ${intent.category} in ${period.replaceAll("_", " ")}. Total spending for the same period is ${formatMoney(summary.total, summary.currency)}.`
+  const message = args.category
+    ? `You spent ${formatMoney(categoryAmount, summary.currency)} on ${args.category} in ${period.replaceAll("_", " ")}. Total spending for the same period is ${formatMoney(summary.total, summary.currency)}.`
     : `Spending for ${period.replaceAll("_", " ")} is ${formatMoney(summary.total, summary.currency)} across ${Object.keys(summary.byCategory).length} categories. ${formatCategoryBreakdown(summary)} Budget remaining this month is ${formatMoney(budgetRemaining, summary.currency)}. ${formatLatestExpenses(appState.expenses)}`;
 
   return {
@@ -235,7 +549,7 @@ function getSpendingSummary(intent) {
       functionName: "get_spending_summary",
       arguments: {
         period,
-        category: intent.category
+        category: args.category
       }
     },
     result: {
@@ -243,7 +557,7 @@ function getSpendingSummary(intent) {
       message,
       summary: {
         ...summary,
-        requestedCategory: intent.category,
+        requestedCategory: args.category,
         requestedCategoryTotal: categoryAmount
       }
     },
@@ -251,8 +565,8 @@ function getSpendingSummary(intent) {
   };
 }
 
-function getFinancialOverview(intent) {
-  const period = intent.period || "current_month";
+function getFinancialOverview(args) {
+  const period = args.period || "current_month";
   const snapshot = getAppSnapshot();
   const summary = buildSpendingSummary(appState.expenses, appState.profile.baseCurrency, period);
   const budgetRemaining = roundMoney(snapshot.profile.monthlyBudget - summary.total);
@@ -269,6 +583,7 @@ function getFinancialOverview(intent) {
       message: [
         `Here is your ${period.replaceAll("_", " ")} overview.`,
         `Your balance is ${formatMoney(snapshot.profile.currentBalance, snapshot.profile.baseCurrency)}.`,
+        `Monthly income is ${formatMoney(snapshot.profile.monthlyIncome, snapshot.profile.baseCurrency)}.`,
         `Spending is ${formatMoney(summary.total, summary.currency)} across ${summary.count} expenses.`,
         formatCategoryBreakdown(summary),
         `Budget remaining this month is ${formatMoney(budgetRemaining, summary.currency)}.`,
@@ -285,21 +600,54 @@ function getFinancialOverview(intent) {
   };
 }
 
-function unsupported(intent) {
+function unsupported(args) {
   return {
     executedAction: {
       functionName: "unsupported",
       arguments: {
-        reason: intent.note || "The requested task is outside this MVP."
+        reason: args.reason || "The requested task is outside this MVP."
       }
     },
     result: {
       ok: false,
       message:
-        "This MVP supports expenses, deleting expenses, profile, spending summaries, and wishlist planning."
+        "This MVP supports expenses, deleting expenses, profile updates, spending summaries, wishlist planning, email, Munich retail product lookup, Munich retail offer lookup, and local merchant deal lookup."
     },
     state: getAppSnapshot()
   };
+}
+
+function formatProfileChanges(changes, currency) {
+  const labels = {
+    name: "name",
+    baseCurrency: "base currency",
+    currentBalance: "current balance",
+    monthlyIncome: "monthly income",
+    monthlyBudget: "monthly budget",
+    savingsGoalName: "savings goal name",
+    savingsGoalTargetAmount: "savings goal target",
+    savingsGoalSavedAmount: "savings goal saved amount"
+  };
+  const moneyFields = new Set([
+    "currentBalance",
+    "monthlyIncome",
+    "monthlyBudget",
+    "savingsGoalTargetAmount",
+    "savingsGoalSavedAmount"
+  ]);
+  const entries = Object.entries(changes);
+
+  if (!entries.length) {
+    return "no fields changed.";
+  }
+
+  return `${entries
+    .map(([field, change]) => {
+      const value = moneyFields.has(field) ? formatMoney(change.to, currency) : change.to;
+
+      return `${labels[field] || field} to ${value}`;
+    })
+    .join(", ")}.`;
 }
 
 function formatMoney(amount, currency) {
@@ -362,21 +710,21 @@ function formatWishlistDetails(wishlist) {
     .join("; ")}.`;
 }
 
-function findExpenseIndex(intent) {
-  if (intent.expenseId) {
-    return appState.expenses.findIndex((expense) => expense.id === intent.expenseId);
+function findExpenseIndex(args) {
+  if (args.expenseId) {
+    return appState.expenses.findIndex((expense) => expense.id === args.expenseId);
   }
 
   return appState.expenses.findIndex((expense) => {
-    if (intent.amount !== null && roundMoney(expense.amount) !== roundMoney(intent.amount)) {
+    if (args.amount !== undefined && roundMoney(expense.amount) !== roundMoney(args.amount)) {
       return false;
     }
 
-    if (intent.category && expense.category !== intent.category) {
+    if (args.category && expense.category !== args.category) {
       return false;
     }
 
-    if (intent.note && !expense.note.toLowerCase().includes(intent.note.toLowerCase())) {
+    if (args.note && !expense.note.toLowerCase().includes(args.note.toLowerCase())) {
       return false;
     }
 
@@ -384,12 +732,35 @@ function findExpenseIndex(intent) {
   });
 }
 
-function buildDeleteExpenseArguments(intent) {
+function buildDeleteExpenseArguments(args) {
   return {
-    expenseId: intent.expenseId,
-    amount: intent.amount,
-    currency: intent.currency,
-    category: intent.category,
-    note: intent.note
+    expenseId: args.expenseId,
+    amount: args.amount,
+    currency: args.currency,
+    category: args.category,
+    note: args.note
   };
+}
+
+function createEmailLogEntry(args, emailResult) {
+  const recipientEmails = args.recipientEmails?.length
+    ? args.recipientEmails
+    : [args.recipientEmail].filter(Boolean);
+
+  return {
+    id: `email_${Date.now()}`,
+    to: formatRecipients(recipientEmails),
+    recipients: recipientEmails,
+    subject: args.emailSubject,
+    body: args.emailBody,
+    status: emailResult.ok ? (emailResult.dryRun ? "dry_run" : "sent") : "failed",
+    provider: emailResult.provider || "gmail",
+    messageId: emailResult.messageId || null,
+    error: emailResult.ok ? null : emailResult.message,
+    createdAt: new Date().toISOString()
+  };
+}
+
+function formatRecipients(recipients) {
+  return (recipients || []).filter(Boolean).join(", ");
 }

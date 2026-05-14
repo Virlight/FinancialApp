@@ -5,6 +5,7 @@ export function createInitialState() {
       name: "Alex Chen",
       baseCurrency: "EUR",
       currentBalance: 1842.5,
+      monthlyIncome: 3200,
       monthlyBudget: 1450,
       savingsGoal: {
         name: "Emergency fund",
@@ -44,7 +45,8 @@ export function createInitialState() {
         status: "planned",
         createdAt: "2026-05-01T10:00:00.000Z"
       }
-    ]
+    ],
+    emailLog: []
   };
 }
 
@@ -55,6 +57,7 @@ export function resetAppState() {
   appState.profile = initialState.profile;
   appState.expenses = initialState.expenses;
   appState.wishlist = initialState.wishlist;
+  appState.emailLog = initialState.emailLog;
   return getAppSnapshot();
 }
 
@@ -63,6 +66,7 @@ export function getAppSnapshot() {
     profile: structuredClone(appState.profile),
     expenses: structuredClone(appState.expenses),
     wishlist: structuredClone(appState.wishlist),
+    emailLog: structuredClone(appState.emailLog),
     summary: buildSpendingSummary(appState.expenses, appState.profile.baseCurrency)
   };
 }

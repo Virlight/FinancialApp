@@ -10,7 +10,11 @@
       href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,600;9..144,800&family=Noto+Sans+SC:wght@400;500;700&display=swap"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="/styles.css" />
+    <link
+      rel="stylesheet"
+      href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    />
+    <link rel="stylesheet" href="/styles.css?v=20260510-7" />
   </head>
   <body>
     <main class="app-shell">
@@ -19,9 +23,8 @@
         <h1>Voice and text commands for an internal finance app.</h1>
         <p class="lead">
           Type English or Chinese commands. Voice input is English-only for better recognition.
-          The demo shows transcription, the Gemini
-          prompt, raw model output, normalized JSON, internal function calls, visible UI updates,
-          and optional Gemini TTS audio replies.
+          The app shows the assistant answer, maps, background job progress,
+          retail source links, and optional audio replies.
         </p>
 
         <form id="assistant-form" class="command-box">
@@ -37,6 +40,11 @@
             <button type="button" class="secondary" id="record-button">Start voice input</button>
             <button type="button" class="secondary" id="reset-button">Reset demo data</button>
           </div>
+          <div class="language-control" aria-label="Assistant output language">
+            <span>Output</span>
+            <button type="button" data-response-language="zh" aria-pressed="true">中文</button>
+            <button type="button" data-response-language="en" aria-pressed="false">English</button>
+          </div>
           <label class="voice-toggle">
             <input type="checkbox" id="speak-toggle" checked />
             <span>Play Gemini TTS reply for text commands. Voice commands always reply with audio.</span>
@@ -49,12 +57,14 @@
           <button type="button" data-example="Delete the 12 euro lunch expense">Delete expense</button>
           <button type="button" data-example="Add a camera to my wishlist with a budget of 800 euros">Add wishlist item</button>
           <button type="button" data-example="Show my wishlist">Show wishlist</button>
+          <button type="button" data-example="Send an email to lee@example.com with subject Budget update saying I spent 12 euros on lunch">Send email</button>
+          <button type="button" data-example="今天慕尼黑 REWE 牛奶价格多少？">Retail price lookup</button>
           <button type="button" data-example="这个月我花了多少？">Chinese summary</button>
         </div>
 
         <section class="conversation" id="conversation" aria-live="polite">
           <div class="empty-state">
-            Enter or record a command to verify: user input → Gemini JSON → internal app action.
+            Enter or record a command to start.
           </div>
         </section>
       </section>
@@ -67,6 +77,10 @@
             <div>
               <span>Balance</span>
               <strong id="profile-balance">-</strong>
+            </div>
+            <div>
+              <span>Monthly Income</span>
+              <strong id="profile-income">-</strong>
             </div>
             <div>
               <span>Monthly Budget</span>
@@ -90,9 +104,21 @@
           <p class="card-label">Wishlist</p>
           <div class="wishlist-list" id="wishlist-list"></div>
         </div>
+
+        <div class="card">
+          <p class="card-label">Email Activity</p>
+          <div class="wishlist-list" id="email-log-list"></div>
+        </div>
+
+        <div class="card">
+          <p class="card-label">Realtime Jobs</p>
+          <div class="realtime-status" id="realtime-status">Connecting...</div>
+          <div class="realtime-job-list" id="realtime-job-list"></div>
+        </div>
       </aside>
     </main>
 
-    <script type="module" src="/app.js"></script>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script type="module" src="/app.js?v=20260510-7"></script>
   </body>
 </html>

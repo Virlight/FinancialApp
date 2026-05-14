@@ -72,7 +72,7 @@ Do not translate non-English speech. Do not answer the command. Do not add expla
   throw lastError || new Error("Gemini transcription failed.");
 }
 
-export async function synthesizeSpeech(text) {
+export async function synthesizeSpeech(text, options = {}) {
   if (!process.env.GEMINI_API_KEY) {
     return {
       ok: false,
@@ -94,7 +94,8 @@ export async function synthesizeSpeech(text) {
   });
   const models = uniqueValues([process.env.GEMINI_TTS_MODEL, defaultTtsModel, fallbackTtsModel]);
   const voiceName = process.env.GEMINI_TTS_VOICE || defaultTtsVoice;
-  const ttsPrompt = `Read this English finance assistant response clearly, naturally, and at a steady pace. Say exactly this text: ${speakableText}`;
+  const languageName = options.responseLanguage === "en" ? "English" : "Simplified Chinese";
+  const ttsPrompt = `Read this ${languageName} finance assistant response clearly, naturally, and at a steady pace. Say exactly this text: ${speakableText}`;
   let lastError = null;
 
   for (const model of models) {

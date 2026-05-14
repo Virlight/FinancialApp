@@ -1,50 +1,67 @@
-import { GoogleGenAI } from "@google/genai";
-import { intentJsonSchema, normalizeIntent } from "./intentSchema.js";
+import { FunctionCallingConfigMode, GoogleGenAI } from "@google/genai";
+import {
+  supportedCategories,
+  supportedCurrencies,
+  supportedFunctionNames,
+  supportedPeriods,
+  supportedPriorities,
+  normalizeFunctionCall
+} from "./functionSchema.js";
+import {
+  findRetailerIdsInText,
+  looksLikeAsianGroceryQuery,
+  looksLikeConsumerElectronicsQuery,
+  retailerConfigs,
+  supportedRetailLookupTypes,
+  supportedRetailerIds
+} from "./retailerConfig.js";
+import { extractKnownMerchantName, looksLikeFoodMerchant } from "./localDeals/lookupLocalDeals.js";
 
 const defaultModel = "gemini-2.5-flash";
+const functionDeclarations = buildFunctionDeclarations();
+const allowedFunctionNames = functionDeclarations.map((declaration) => declaration.name);
 
-export async function parseAssistantIntent(userText) {
+export async function parseAssistantFunctionCall(userText) {
   const input = String(userText || "").trim();
-  const prompt = input ? buildPrompt(input) : null;
+  const systemInstruction = buildSystemInstruction();
+  const toolConfig = buildToolConfig(input);
 
   if (!input) {
-    const parsedIntent = normalizeIntent({
-      intent: "unsupported",
-      amount: null,
-      currency: null,
-      category: null,
-      note: "Empty input",
-      period: null,
-      date: null,
-      confidence: 1
+    const functionCall = normalizeFunctionCall({
+      name: "unsupported",
+      args: {
+        reason: "Empty input"
+      }
     });
 
     return {
       provider: "mock",
       model: "local-rule-parser",
-      parsedIntent,
+      functionCall,
       debug: buildDebugPayload({
         input,
-        prompt,
-        rawModelOutput: JSON.stringify(parsedIntent, null, 2),
-        parserMode: "empty-input"
+        systemInstruction,
+        rawModelOutput: JSON.stringify([functionCall], null, 2),
+        parserMode: "empty-input",
+        toolConfig
       })
     };
   }
 
   if (!process.env.GEMINI_API_KEY) {
-    const parsedIntent = normalizeIntent(parseWithMockRules(input));
+    const functionCall = normalizeFunctionCall(parseWithMockRules(input));
 
     return {
       provider: "mock",
       model: "local-rule-parser",
-      parsedIntent,
+      functionCall,
       warning: "GEMINI_API_KEY is not set. Used local mock parser for demo verification.",
       debug: buildDebugPayload({
         input,
-        prompt,
-        rawModelOutput: JSON.stringify(parsedIntent, null, 2),
-        parserMode: "mock-fallback"
+        systemInstruction,
+        rawModelOutput: JSON.stringify([functionCall], null, 2),
+        parserMode: "mock-fallback",
+        toolConfig
       })
     };
   }
@@ -57,134 +74,512 @@ export async function parseAssistantIntent(userText) {
 
     const response = await ai.models.generateContent({
       model,
-      contents: prompt,
+      contents: input,
       config: {
         temperature: 0,
-        responseMimeType: "application/json",
-        responseJsonSchema: intentJsonSchema
+        systemInstruction,
+        tools: [
+          {
+            functionDeclarations
+          }
+        ],
+        toolConfig
       }
     });
-    const parsedIntent = normalizeIntent(JSON.parse(response.text));
+    const functionCall = normalizeFunctionCall(extractFunctionCall(response));
+    const rawModelOutput = JSON.stringify(response.functionCalls || [], null, 2);
 
     return {
       provider: "gemini",
       model,
-      parsedIntent,
-      rawText: response.text,
+      functionCall,
       debug: buildDebugPayload({
         input,
-        prompt,
-        rawModelOutput: response.text,
-        parserMode: "gemini"
+        systemInstruction,
+        rawModelOutput,
+        parserMode: "gemini-function-calling",
+        toolConfig
       })
     };
   } catch (error) {
-    const parsedIntent = normalizeIntent(parseWithMockRules(input));
+    const functionCall = normalizeFunctionCall(parseWithMockRules(input));
 
     return {
       provider: "mock",
       model: "local-rule-parser",
-      parsedIntent,
+      functionCall,
       warning: `Gemini parsing failed. Used local mock parser instead: ${error.message}`,
       debug: buildDebugPayload({
         input,
-        prompt,
-        rawModelOutput: JSON.stringify(parsedIntent, null, 2),
-        parserMode: "gemini-error-fallback",
+        systemInstruction,
+        rawModelOutput: JSON.stringify([functionCall], null, 2),
+        parserMode: "gemini-function-calling-error-fallback",
+        toolConfig,
         error: error.message
       })
     };
   }
 }
 
-function buildDebugPayload({ input, prompt, rawModelOutput, parserMode, error = null }) {
+export async function parsePostResponseFunctionCall({ input, finalMessage }) {
+  const userText = String(input || "").trim();
+  const message = String(finalMessage || "").trim();
+
+  if (!looksLikeSendFinalAnswerEmailRequest(userText) || !message) {
+    return null;
+  }
+
+  const fallbackCall = normalizeFunctionCall({
+    name: "send_email",
+    args: {
+      recipientEmails: resolveRequestedRecipientEmails(userText),
+      emailSubject: buildFinalAnswerEmailSubject(userText),
+      emailBody: message
+    }
+  });
+
+  if (!fallbackCall.args.recipientEmails?.length && !fallbackCall.args.recipientEmail) {
+    return null;
+  }
+
+  if (!process.env.GEMINI_API_KEY) {
+    return {
+      provider: "mock",
+      model: "local-post-action-parser",
+      functionCall: fallbackCall,
+      debug: {
+        parserMode: "post-response-mock-fallback",
+        input: userText,
+        finalMessage: message
+      }
+    };
+  }
+
+  const systemInstruction = `
+You decide whether to call a post-response function after the assistant has produced a final answer.
+Only call send_email when the original user explicitly asked to email/send/mail the final answer/result.
+If the user asks for multiple recipients, call send_email with recipientEmails containing every requested email address.
+If the user says "to me", "给我", "我自己的邮箱", or similar, include this configured recipient too: ${process.env.GMAIL_USER || "missing"}.
+The email body must be exactly the final answer text supplied by the app.
+If no email should be sent, call unsupported.
+`.trim();
+
+  try {
+    const ai = new GoogleGenAI({
+      apiKey: process.env.GEMINI_API_KEY
+    });
+    const model = process.env.GEMINI_MODEL || defaultModel;
+    const response = await ai.models.generateContent({
+      model,
+      contents: `
+Original user input:
+${userText}
+
+Final answer to email:
+${message}
+`.trim(),
+      config: {
+        temperature: 0,
+        systemInstruction,
+        tools: [
+          {
+            functionDeclarations: buildPostResponseFunctionDeclarations()
+          }
+        ],
+        toolConfig: {
+          functionCallingConfig: {
+            mode: FunctionCallingConfigMode.ANY,
+            allowedFunctionNames: ["send_email", "unsupported"]
+          }
+        }
+      }
+    });
+    const functionCall = normalizeFunctionCall(extractFunctionCall(response));
+
+    if (functionCall.name !== "send_email") {
+      return null;
+    }
+
+    const enforcedFunctionCall = normalizeFunctionCall({
+      name: "send_email",
+      args: {
+        recipientEmails:
+          mergeRecipientEmails(
+            functionCall.args.recipientEmails,
+            functionCall.args.recipientEmail,
+            fallbackCall.args.recipientEmails
+          ),
+        emailSubject: functionCall.args.emailSubject || fallbackCall.args.emailSubject,
+        emailBody: message
+      }
+    });
+
+    return {
+      provider: "gemini",
+      model,
+      functionCall: enforcedFunctionCall,
+      debug: {
+        parserMode: "post-response-function-calling",
+        input: userText,
+        systemInstruction,
+        rawModelOutput: JSON.stringify(response.functionCalls || [], null, 2)
+      }
+    };
+  } catch (error) {
+    return {
+      provider: "mock",
+      model: "local-post-action-parser",
+      functionCall: fallbackCall,
+      warning: `Post-response function calling failed. Used local fallback: ${error.message}`,
+      debug: {
+        parserMode: "post-response-error-fallback",
+        input: userText,
+        finalMessage: message,
+        error: error.message
+      }
+    };
+  }
+}
+
+function buildDebugPayload({ input, systemInstruction, rawModelOutput, parserMode, toolConfig, error = null }) {
   return {
     parserMode,
     input,
-    promptSentToModel: prompt,
+    promptSentToModel: {
+      systemInstruction,
+      userInput: input
+    },
     modelOutputContract: {
-      responseMimeType: "application/json",
-      schema: intentJsonSchema
+      mode: "function_calling",
+      toolConfig,
+      tools: [
+        {
+          functionDeclarations
+        }
+      ]
     },
     rawModelOutput,
-    normalizedIntentNote:
-      "The app validates and normalizes the raw model JSON before dispatching an internal function.",
+    functionCallingNote:
+      "Gemini returns a registered function call. The app validates that function call and executes it directly.",
     error
   };
 }
 
-function buildPrompt(input) {
+function buildSystemInstruction() {
   const today = new Date().toISOString().slice(0, 10);
 
   return `
-You are an intent parser for a Financial App voice assistant MVP.
-Return one JSON object that matches the provided schema. Do not include markdown.
-
-Supported internal app actions:
-1. create_expense
-   Use this when the user asks to record spending.
-   Required business fields: amount, currency.
-   category must be one of: food, transport, shopping, bills, entertainment, health, education, travel, other.
-   Examples:
-   - "帮我记录一笔 12 欧的午饭支出" means amount 12, currency EUR, category food, note lunch.
-   - "I spent 8 euros on coffee" means amount 8, currency EUR, category food, note coffee.
-
-2. get_profile
-   Use this when the user asks to see profile, account info, balance, budget, or financial profile.
-   Examples: "查看我的 profile", "show my balance", "我的账户情况".
-
-3. get_spending_summary
-   Use this when the user asks for spending summary, total spending, category breakdown, or how much was spent.
-   period should be today, current_week, current_month, or all_time. Default to current_month when unclear.
-   If the user asks about a specific category, set category too.
-   Examples:
-   - "How much did I spend on transport this month?" means category transport, period current_month.
-   - "我的本月交通花费是多少" means category transport, period current_month.
-
-4. delete_expense
-   Use this when the user asks to remove or delete an existing expense.
-   Prefer expenseId if the user gives an id. Otherwise set selectors like amount, category, and note.
-   Examples:
-   - "delete the 12 euro lunch expense" means amount 12, currency EUR, category food, note lunch.
-   - "删除咖啡那笔支出" means category food, note coffee.
-   - "remove my latest transport expense" means category transport, note null.
-
-5. create_wishlist_item
-   Use this when the user asks to create a purchase plan, savings plan for an item, or wishlist item.
-   itemName is required. targetAmount is the intended price or budget when present.
-   priority should be low, medium, or high. Default to medium when unclear.
-   Examples:
-   - "Add a MacBook to my wishlist with a budget of 1200 euros" means itemName MacBook, targetAmount 1200, currency EUR.
-   - "帮我计划买一台 800 欧的相机" means itemName camera, targetAmount 800, currency EUR.
-
-6. get_wishlist
-   Use this when the user asks to view, list, check, or calculate purchase plans or wishlist items.
-   If the user asks for wishlist amount, wishlist total, purchase plan budget, or planned purchase cost, use this intent.
-   Examples: "show my wishlist", "what's my wishlist amount?", "wishlist total", "查看我的购买计划".
-
-7. get_financial_overview
-   Use this when the user asks for an overall summary, current financial situation, or a broad recap.
-   The app will combine balance, spending summary, category breakdown, latest expenses, and wishlist.
-   Examples:
-   - "Summarize my current financial situation"
-   - "总结一下当前我的支出情况"
-   - "Give me a full overview"
-
-8. unsupported
-   Use this for transfers, investments, payments, loans, or anything outside this MVP.
-
-Rules:
+You route each Financial App assistant request by calling exactly one registered function.
 - Current date is ${today}.
-- Use EUR when user says euro, euros, €, 欧, or 欧元.
-- Use USD when user says dollar, dollars, or $.
+- Use the registered unsupported function for transfers, investments, payments, loans, or anything outside this MVP.
+- Use EUR when user says euro, euros, €, 欧, or 欧元. Use USD when user says dollar, dollars, or $.
+- If the user says 块 or 块钱 without RMB/人民币/CNY, treat the currency as unclear and default to EUR for this Munich-based app.
 - Translate common Chinese finance phrases into the schema values.
-- For irrelevant fields, output null.
-- Always include all fields required by the schema, even when their value is null.
-- confidence should be between 0 and 1.
-
-User input:
-${input}
+- For unclear summary periods, default to current_month.
+- When the user asks to change, set, edit, update, or modify personal profile fields such as name, monthly income, monthly budget, current balance, base currency, or savings goal, call update_profile.
+- When a request asks to send email, extract every requested recipient email address, a short subject, and the plain-text body. Use recipientEmails for multiple recipients. If a required email field is missing, call unsupported.
+- If a request asks to look up information and then email the final answer, first call the information lookup function. Emailing the final answer is handled after final response synthesis.
+- Routing priority: for combined requests such as "look up/summarize/check X and send the final answer to me", ignore the email part during this first function call. Do not call send_email or unsupported because the first step has no recipient.
+- If the user is recording an expense/spending event, call create_expense first. The app runs discount lookup as a post-action background job after the expense is recorded.
+- When a request asks for retailer discounts, offers, weekly deals, Angebote, Prospekt, or 打折/优惠 at Munich retailers, call lookup_retail_offers. Default the location to Munich, Germany and period to current_week.
+- When a request asks for discounts, coupons, app offers, deals, Gutscheine, 打折, 折扣, 优惠, or 促销 at a named restaurant, cafe, food chain, or local merchant such as McDonald's/麦当劳, KFC/肯德基, Burger King/汉堡王, Subway/赛百味, or Starbucks/星巴克, call lookup_local_deals. Default location to Munich, Germany and period to current_week.
+- When a request asks for current product price, stock, or availability at Munich retailers such as MediaMarkt, Saturn, EDEKA, ROSSMANN, REWE, PENNY, Lidl, ALDI, or IKEA, call lookup_store_product. Default the location to Munich, Germany. If no retailer is specified, use all_supported.
+- For consumer electronics such as iPad, Apple Pencil, phones, tablets, laptops, or headphones, default unspecified retailers to mediamarkt and saturn.
+- For Asian grocery or Asian supermarket discovery in Munich, including queries for 肉松, pork floss, rousong, or meat floss, use retailer id asian_grocery. This can include Asian supermarkets that are not pre-enumerated.
 `.trim();
+}
+
+function buildToolConfig(input = "") {
+  return {
+    functionCallingConfig: {
+      mode: FunctionCallingConfigMode.ANY,
+      allowedFunctionNames: getAllowedFunctionNamesForInput(input)
+    }
+  };
+}
+
+function getAllowedFunctionNamesForInput(input) {
+  const lowerInput = String(input || "").toLowerCase();
+
+  if (!looksLikeSendFinalAnswerEmailRequest(input)) {
+    return allowedFunctionNames;
+  }
+
+  if (looksLikeRetailOfferRequest(input)) {
+    return ["lookup_retail_offers", "unsupported"];
+  }
+
+  if (looksLikeLocalDealRequest(input)) {
+    return ["lookup_local_deals", "unsupported"];
+  }
+
+  if (looksLikeRetailLookupRequest(input)) {
+    return ["lookup_store_product", "unsupported"];
+  }
+
+  if (looksLikeOverviewRequest(lowerInput)) {
+    return ["get_financial_overview", "unsupported"];
+  }
+
+  if (looksLikeSummaryRequest(lowerInput)) {
+    return ["get_spending_summary", "unsupported"];
+  }
+
+  if (
+    looksLikeWishlistRequest(lowerInput) &&
+    (looksLikeListRequest(lowerInput) || looksLikeWishlistAmountQuestion(lowerInput))
+  ) {
+    return ["get_wishlist", "unsupported"];
+  }
+
+  return allowedFunctionNames;
+}
+
+function extractFunctionCall(response) {
+  const functionCall = response.functionCalls?.[0];
+
+  if (!functionCall?.name) {
+    throw new Error("Gemini did not return a function call.");
+  }
+
+  return functionCall;
+}
+
+function buildFunctionDeclarations() {
+  return [
+    {
+      name: "create_expense",
+      description: "Record a user expense or spending event.",
+      parametersJsonSchema: objectSchema(
+        {
+          amount: numberSchema("Positive expense amount."),
+          currency: enumSchema(supportedCurrencies, "ISO currency code."),
+          category: enumSchema(supportedCategories, "Finance category."),
+          note: stringSchema("Short user-facing expense note, such as lunch or coffee."),
+          date: stringSchema("ISO date YYYY-MM-DD if the user mentions a date.")
+        },
+        ["amount", "currency"]
+      )
+    },
+    {
+      name: "delete_expense",
+      description:
+        "Delete an existing expense by explicit id or natural-language selectors such as amount, category, and note.",
+      parametersJsonSchema: objectSchema({
+        expenseId: stringSchema("Expense id when explicitly provided."),
+        amount: numberSchema("Expense amount selector."),
+        currency: enumSchema(supportedCurrencies, "Currency selector."),
+        category: enumSchema(supportedCategories, "Category selector."),
+        note: stringSchema("Description selector, such as lunch or coffee.")
+      })
+    },
+    {
+      name: "create_wishlist_item",
+      description: "Create a wishlist item, purchase plan, or savings plan for an item.",
+      parametersJsonSchema: objectSchema(
+        {
+          itemName: stringSchema("Wishlist or purchase plan item name."),
+          targetAmount: numberSchema("Target price or budget when present."),
+          currency: enumSchema(supportedCurrencies, "ISO currency code."),
+          priority: enumSchema(supportedPriorities, "Wishlist priority."),
+          dueDate: stringSchema("ISO date YYYY-MM-DD for the purchase target date."),
+          note: stringSchema("Short note for the wishlist item.")
+        },
+        ["itemName"]
+      )
+    },
+    {
+      name: "get_wishlist",
+      description:
+        "View, list, check, or calculate purchase plans, wishlist items, wishlist amount, or planned purchase cost.",
+      parametersJsonSchema: objectSchema({})
+    },
+    {
+      name: "send_email",
+      description: "Send a plain-text email message through the configured Gmail sender.",
+      parametersJsonSchema: objectSchema(
+        {
+          recipientEmail: stringSchema("Recipient email address."),
+          recipientEmails: arraySchema(
+            stringSchema("Recipient email address."),
+            "Recipient email addresses when the user requests multiple recipients."
+          ),
+          emailSubject: stringSchema("Short email subject line."),
+          emailBody: stringSchema("Plain-text email body.")
+        },
+        ["emailSubject", "emailBody"]
+      )
+    },
+    {
+      name: "lookup_store_product",
+      description:
+        "Look up current product price, stock, availability, or product information for supported Munich physical retailers using grounded web research.",
+      parametersJsonSchema: objectSchema(
+        {
+          productQuery: stringSchema("The product or product category to look up."),
+          retailers: arraySchema(
+            enumSchema(supportedRetailerIds, "Supported retailer id."),
+            "Retailer ids to search. Use mediamarkt and saturn for consumer electronics when the user does not specify a retailer. Use asian_grocery for Munich Asian supermarket discovery. Otherwise use all_supported."
+          ),
+          location: stringSchema("City or local area. Default to Munich, Germany."),
+          lookupType: enumSchema(supportedRetailLookupTypes, "The type of product lookup requested."),
+          date: stringSchema("ISO date YYYY-MM-DD when the user asks about a specific day.")
+        },
+        ["productQuery"]
+      )
+    },
+    {
+      name: "lookup_retail_offers",
+      description:
+        "Look up current or recent retailer discounts, weekly offers, Angebote, promotions, or prospect pages for supported Munich retailers.",
+      parametersJsonSchema: objectSchema(
+        {
+          retailers: arraySchema(
+            enumSchema(supportedRetailerIds, "Supported retailer id."),
+            "Retailer ids to search for offers. Use edeka for EDEKA/edika offer questions."
+          ),
+          location: stringSchema("City or local area. Default to Munich, Germany."),
+          period: enumSchema(supportedPeriods, "Offer period. Use current_week for recent/current offers."),
+          date: stringSchema("ISO date YYYY-MM-DD when the user asks about a specific day.")
+        },
+        ["retailers"]
+      )
+    },
+    {
+      name: "lookup_local_deals",
+      description:
+        "Look up current or recent discounts, coupons, app offers, meal deals, Gutscheine, Aktionen, or promotions for a named Munich restaurant, cafe, food chain, or local merchant.",
+      parametersJsonSchema: objectSchema(
+        {
+          merchantQuery: stringSchema("Named merchant, restaurant, cafe, food chain, or local shop, such as McDonald's or 麦当劳."),
+          productQuery: stringSchema("Optional product, meal, or purchase context, such as 汉堡套餐."),
+          category: enumSchema(supportedCategories, "Category context. Use food for restaurants and food chains."),
+          location: stringSchema("City or local area. Default to Munich, Germany."),
+          period: enumSchema(supportedPeriods, "Offer period. Use current_week for recent/current offers."),
+          date: stringSchema("ISO date YYYY-MM-DD when the user asks about a specific day.")
+        },
+        ["merchantQuery"]
+      )
+    },
+    {
+      name: "update_profile",
+      description:
+        "Update editable personal finance profile fields such as name, base currency, current balance, monthly income, monthly budget, or savings goal.",
+      parametersJsonSchema: objectSchema({
+        name: stringSchema("User display name."),
+        baseCurrency: enumSchema(supportedCurrencies, "Default profile currency."),
+        currentBalance: numberSchema("Current account balance."),
+        monthlyIncome: numberSchema("Monthly income amount."),
+        monthlyBudget: numberSchema("Monthly spending budget amount."),
+        savingsGoalName: stringSchema("Savings goal display name."),
+        savingsGoalTargetAmount: numberSchema("Savings goal target amount."),
+        savingsGoalSavedAmount: numberSchema("Amount already saved toward the savings goal.")
+      })
+    },
+    {
+      name: "get_profile",
+      description: "Show the user's profile, account info, current balance, monthly budget, or assets.",
+      parametersJsonSchema: objectSchema({})
+    },
+    {
+      name: "get_spending_summary",
+      description:
+        "Show spending totals, category breakdowns, or answer how much was spent for a period.",
+      parametersJsonSchema: objectSchema(
+        {
+          period: enumSchema(supportedPeriods, "Summary period. Default to current_month when unclear."),
+          category: enumSchema(supportedCategories, "Specific category when the user asks for one.")
+        },
+        ["period"]
+      )
+    },
+    {
+      name: "get_financial_overview",
+      description:
+        "Show an overall financial recap combining balance, spending summary, category breakdown, latest expenses, and wishlist.",
+      parametersJsonSchema: objectSchema({
+        period: enumSchema(supportedPeriods, "Overview period. Default to current_month when unclear.")
+      })
+    },
+    {
+      name: "unsupported",
+      description:
+        "Use when the request is outside this MVP, ambiguous, missing required fields, or cannot be safely mapped to another registered function.",
+      parametersJsonSchema: objectSchema(
+        {
+          reason: stringSchema("Short reason the request cannot be handled.")
+        },
+        ["reason"]
+      )
+    }
+  ];
+}
+
+function buildPostResponseFunctionDeclarations() {
+  return [
+    {
+      name: "send_email",
+      description: "Send the final assistant answer by email after another tool has completed.",
+      parametersJsonSchema: objectSchema(
+        {
+          recipientEmail: stringSchema("Recipient email address."),
+          recipientEmails: arraySchema(
+            stringSchema("Recipient email address."),
+            "Recipient email addresses when the user requests multiple recipients."
+          ),
+          emailSubject: stringSchema("Short email subject line."),
+          emailBody: stringSchema("Plain-text email body. Must be the final answer text.")
+        },
+        ["emailSubject", "emailBody"]
+      )
+    },
+    {
+      name: "unsupported",
+      description: "Use when no post-response action is needed.",
+      parametersJsonSchema: objectSchema({
+        reason: stringSchema("Short reason no post-response action is needed.")
+      })
+    }
+  ];
+}
+
+function objectSchema(properties, required = []) {
+  return {
+    type: "object",
+    properties,
+    required,
+    additionalProperties: false
+  };
+}
+
+function stringSchema(description) {
+  return {
+    type: "string",
+    description
+  };
+}
+
+function numberSchema(description) {
+  return {
+    type: "number",
+    description
+  };
+}
+
+function enumSchema(values, description) {
+  return {
+    type: "string",
+    enum: values,
+    description
+  };
+}
+
+function arraySchema(items, description) {
+  return {
+    type: "array",
+    items,
+    description
+  };
 }
 
 function parseWithMockRules(input) {
@@ -192,38 +587,60 @@ function parseWithMockRules(input) {
   const amount = extractAmount(input);
   const currency = extractCurrency(input);
 
+  if (looksLikeRetailOfferRequest(input)) {
+    return functionCall("lookup_retail_offers", {
+      retailers: findRetailerIdsInText(input),
+      location: extractRetailLocation(input),
+      period: extractOfferPeriod(input),
+      date: extractRetailDate(input)
+    });
+  }
+
+  if (looksLikeRetailLookupRequest(input)) {
+    return functionCall("lookup_store_product", {
+      productQuery: extractRetailProductQuery(input),
+      retailers: findRetailerIdsInText(input),
+      location: extractRetailLocation(input),
+      lookupType: extractRetailLookupType(input),
+      date: extractRetailDate(input)
+    });
+  }
+
+  if (looksLikeEmailRequest(lowerInput)) {
+    return functionCall("send_email", {
+      recipientEmails: resolveRequestedRecipientEmails(input),
+      emailSubject: extractEmailSubject(input),
+      emailBody: extractEmailBody(input)
+    });
+  }
+
+  if (looksLikeProfileUpdateRequest(input)) {
+    return functionCall("update_profile", extractProfileUpdateArgs(input));
+  }
+
   if (
     looksLikeWishlistRequest(lowerInput) &&
     !looksLikeWishlistCreateRequest(lowerInput) &&
     (looksLikeListRequest(lowerInput) || looksLikeWishlistAmountQuestion(lowerInput))
   ) {
-    return baseIntent({
-      intent: "get_wishlist",
-      note: "wishlist request",
-      confidence: 0.76
-    });
+    return functionCall("get_wishlist");
   }
 
   if (looksLikeOverviewRequest(lowerInput)) {
-    return baseIntent({
-      intent: "get_financial_overview",
-      note: "financial overview request",
-      period: extractPeriod(lowerInput),
-      confidence: 0.8
+    return functionCall("get_financial_overview", {
+      period: extractPeriod(lowerInput)
     });
   }
 
   if (looksLikeWishlistRequest(lowerInput)) {
     const itemName = extractWishlistItemName(input);
 
-    return baseIntent({
-      intent: "create_wishlist_item",
+    return functionCall("create_wishlist_item", {
       itemName,
       targetAmount: amount,
       currency: currency || (amount === null ? null : "EUR"),
       priority: extractPriority(lowerInput),
-      note: "purchase plan",
-      confidence: 0.7
+      note: "purchase plan"
     });
   }
 
@@ -231,31 +648,22 @@ function parseWithMockRules(input) {
     const category = extractCategory(lowerInput);
     const note = extractNote(lowerInput, category);
 
-    return baseIntent({
-      intent: "delete_expense",
+    return functionCall("delete_expense", {
       amount,
       currency,
       category,
-      note: note === "other" ? null : note,
-      confidence: 0.68
+      note: note === "other" ? null : note
     });
   }
 
   if (looksLikeProfileRequest(lowerInput)) {
-    return baseIntent({
-      intent: "get_profile",
-      note: "profile request",
-      confidence: 0.82
-    });
+    return functionCall("get_profile");
   }
 
   if (looksLikeSummaryRequest(lowerInput)) {
-    return baseIntent({
-      intent: "get_spending_summary",
-      note: "spending summary request",
+    return functionCall("get_spending_summary", {
       period: extractPeriod(lowerInput),
-      category: extractSpecificCategory(lowerInput),
-      confidence: 0.78
+      category: extractSpecificCategory(lowerInput)
     });
   }
 
@@ -263,39 +671,34 @@ function parseWithMockRules(input) {
     const category = extractCategory(lowerInput);
     const note = extractNote(lowerInput, category);
 
-    return baseIntent({
-      intent: "create_expense",
+    return functionCall("create_expense", {
       amount,
       currency: currency || "EUR",
       category,
-      note,
-      confidence: 0.72
+      note
     });
   }
 
-  return baseIntent({
-    intent: "unsupported",
-    note: "The mock parser could not map this request to an MVP action.",
-    confidence: 0.65
+  if (looksLikeLocalDealRequest(input)) {
+    return functionCall("lookup_local_deals", {
+      merchantQuery: extractLocalMerchantQuery(input),
+      productQuery: extractLocalDealProductQuery(input),
+      category: "food",
+      location: extractRetailLocation(input),
+      period: extractOfferPeriod(input),
+      date: extractRetailDate(input)
+    });
+  }
+
+  return functionCall("unsupported", {
+    reason: "The mock parser could not map this request to an MVP action."
   });
 }
 
-function baseIntent(overrides) {
+function functionCall(name, args = {}) {
   return {
-    intent: "unsupported",
-    amount: null,
-    currency: null,
-    category: null,
-    note: null,
-    period: null,
-    date: null,
-    expenseId: null,
-    itemName: null,
-    targetAmount: null,
-    priority: null,
-    dueDate: null,
-    confidence: 0,
-    ...overrides
+    name,
+    args
   };
 }
 
@@ -322,15 +725,384 @@ function extractCurrency(input) {
     return "GBP";
   }
 
-  if (/(cny|rmb|人民币|元)/i.test(input)) {
+  if (/(cny|rmb|人民币|¥)/i.test(input)) {
     return "CNY";
   }
 
   return null;
 }
 
+function extractRecipientEmail(input) {
+  return extractRecipientEmails(input)[0] || null;
+}
+
+function extractRecipientEmails(input) {
+  const matches = String(input || "").match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi) || [];
+  return mergeRecipientEmails(matches);
+}
+
+function resolveRequestedRecipientEmails(input) {
+  const requestedEmails = extractRecipientEmails(input);
+
+  if (looksLikeOwnEmailRecipient(input)) {
+    requestedEmails.push(process.env.GMAIL_USER);
+  }
+
+  return mergeRecipientEmails(requestedEmails);
+}
+
+function mergeRecipientEmails(...values) {
+  const rawEmails = values.flatMap((value) => {
+    if (Array.isArray(value)) {
+      return value;
+    }
+
+    if (typeof value === "string") {
+      return value.split(/[,\s;]+/);
+    }
+
+    return [];
+  });
+  const seen = new Set();
+  const emails = [];
+
+  for (const rawEmail of rawEmails) {
+    const email = typeof rawEmail === "string" ? rawEmail.trim() : "";
+    const key = email.toLowerCase();
+
+    if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) && !seen.has(key)) {
+      seen.add(key);
+      emails.push(email);
+    }
+  }
+
+  return emails;
+}
+
+function looksLikeOwnEmailRecipient(input) {
+  return /(\bto me\b|\bmy email\b|\bmy own email\b|给我|发给我|发到我|我的邮箱|自己.*邮箱|我自己.*邮箱)/i.test(
+    input
+  );
+}
+
+function extractEmailSubject(input) {
+  const patterns = [
+    /subject\s*(?:is|:)?\s*["“]?(.+?)(?:["”]?\s+(?:saying|body|message|content)\b|$)/i,
+    /主题(?:是|为|:)?\s*["“]?(.+?)(?:["”]?[，,。]\s*(?:内容|正文)|$)/i
+  ];
+
+  for (const pattern of patterns) {
+    const match = input.match(pattern);
+
+    if (match?.[1]) {
+      return cleanupEmailText(match[1]);
+    }
+  }
+
+  return "Message from Financial App";
+}
+
+function extractEmailBody(input) {
+  const patterns = [
+    /(?:saying|body|message|content)\s*(?:is|:)?\s*["“]?(.+?)["”]?$/i,
+    /(?:内容|正文)(?:是|为|:)?\s*["“]?(.+?)["”]?$/i
+  ];
+
+  for (const pattern of patterns) {
+    const match = input.match(pattern);
+
+    if (match?.[1]) {
+      return cleanupEmailText(match[1]);
+    }
+  }
+
+  return input.replace(extractRecipientEmail(input) || "", "").trim();
+}
+
+function cleanupEmailText(text) {
+  return text
+    .replace(/^[，,。:\s]+|[，,。:\s]+$/g, "")
+    .replace(/^["“]|["”]$/g, "")
+    .trim();
+}
+
+function looksLikeRetailLookupRequest(input) {
+  const lowerInput = input.toLowerCase();
+  const hasRetailer = retailerConfigs.some((retailer) =>
+    [retailer.id, retailer.displayName.toLowerCase(), ...retailer.aliases].some((alias) =>
+      lowerInput.includes(alias.toLowerCase())
+    )
+  );
+  const hasRetailIntent =
+    /(price|cost|how much|availability|available|in stock|stock|store|shop|retailer|价格|多少钱|多少|有货|库存|商品|商场|超市|门店|实体店|今天)/i.test(
+      input
+    );
+
+  return (hasRetailer || looksLikeConsumerElectronicsQuery(input) || looksLikeAsianGroceryQuery(input)) && hasRetailIntent;
+}
+
+function looksLikeRetailOfferRequest(input) {
+  const lowerInput = input.toLowerCase();
+  const hasRetailer = retailerConfigs.some((retailer) =>
+    [retailer.id, retailer.displayName.toLowerCase(), ...retailer.aliases].some((alias) =>
+      lowerInput.includes(alias.toLowerCase())
+    )
+  );
+  const hasOfferIntent = /(discount|deal|offer|offers|promotion|promo|sale|weekly|prospekt|angebote|angebot|打折|折扣|优惠|促销|特价|近期|本周|这周|最近)/i.test(
+    input
+  );
+
+  return hasRetailer && hasOfferIntent;
+}
+
+function looksLikeLocalDealRequest(input) {
+  const hasOfferIntent = /(discount|deal|deals|offer|offers|coupon|coupons|promotion|promo|sale|gutschein|gutscheine|angebote|angebot|aktion|aktionen|打折|折扣|优惠|促销|特价|券|套餐|近期|本周|这周|最近)/i.test(
+    input
+  );
+
+  return hasOfferIntent && looksLikeFoodMerchant(input);
+}
+
+function extractLocalMerchantQuery(input) {
+  const knownMerchant = extractKnownMerchantName(input);
+
+  if (knownMerchant) {
+    return knownMerchant;
+  }
+
+  const patterns = [
+    /(?:最近|当前|现在|本周|这周)?\s*([^，。?？]+?)(?:有什么|有哪些|有没有).*(?:打折|折扣|优惠|促销|特价|券|套餐)/i,
+    /(?:discounts?|deals?|offers?|coupons?|promotions?)\s+(?:at|for|from)\s+(.+?)(?:\s+(?:in|near|munich|münchen)|$)/i,
+    /(?:at|from)\s+(.+?)\s+(?:discounts?|deals?|offers?|coupons?)/i
+  ];
+
+  for (const pattern of patterns) {
+    const match = input.match(pattern);
+
+    if (match?.[1]) {
+      return cleanupLocalDealText(match[1]);
+    }
+  }
+
+  return cleanupLocalDealText(input);
+}
+
+function extractLocalDealProductQuery(input) {
+  const cleaned = String(input || "")
+    .replace(extractLocalMerchantQuery(input), " ")
+    .replace(/(mcdonald'?s?|麦当劳|麦當勞|burger king|汉堡王|漢堡王|kfc|肯德基|subway|赛百味|賽百味|starbucks|星巴克)/gi, " ")
+    .replace(/(最近|当前|现在|本周|这周|有什么|有哪些|有没有|打折|折扣|优惠|促销|特价|券|帮我|能帮我|看看|查看|查询|吗|么|munich|münchen|muenchen|deals?|offers?|discounts?|coupons?|promotions?|at|for|from|in|near)/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return cleanupLocalDealText(cleaned) || null;
+}
+
+function cleanupLocalDealText(text) {
+  return String(text || "")
+    .replace(/^[，,。:!?？\s]+|[，,。:!?？\s]+$/g, "")
+    .trim();
+}
+
+function extractRetailProductQuery(input) {
+  const specificPatterns = [
+    /^([^，。?？]+?)(?:在|于)\s*(?:munich|münchen|muenchen|慕尼黑)?\s*(?:哪个|哪家|哪些)?.*(?:亚洲超市|亚洲商店|亚超).*(?:有卖|卖|有货)/i,
+    /(?:where\s+(?:can|could)\s+i\s+(?:buy|find)|which\s+.+?(?:sells|has))\s+(.+?)\s+(?:in|at|near).*(?:asian\s+(?:supermarket|grocery|market)|asia\s+markt)/i,
+    /(?:有没有|有无|卖不卖)([^，。?？]+?)(?:这个)?(?:商品)?(?:，|。|,|\.|$|有的话|的话|价格|多少钱|多少)/i,
+    /(?:里|下|卖|有)([^，。?？]+?)(?:价格|多少钱|多少|有货|库存|信息|内容)/i,
+    /(?:price|cost|availability|stock)\s+(?:of|for)\s+(.+?)\s+(?:at|in|near|from)\b/i,
+    /(?:how much is|how much are)\s+(.+?)\s+(?:at|in|near|from)\b/i
+  ];
+
+  for (const pattern of specificPatterns) {
+    const match = input.match(pattern);
+
+    if (match?.[1]) {
+      return cleanupRetailProductText(match[1]);
+    }
+  }
+
+  let cleaned = input;
+
+  for (const retailer of retailerConfigs) {
+    for (const alias of [retailer.id, retailer.displayName, ...retailer.aliases]) {
+      cleaned = cleaned.replace(new RegExp(escapeRegExp(alias), "gi"), " ");
+    }
+  }
+
+  cleaned = cleaned
+    .replace(
+      /(today|current|now|munich|münchen|muenchen|germany|price|cost|how much|availability|available|in stock|stock|store|stores|shop|retailer|near|find|look up|show|please|which|what|今天|当前|现在|慕尼黑|德国|价格|多少钱|多少|有货|库存|商品|商场|超市|门店|实体店|亚洲超市|亚洲商店|亚超|查看|查询|查一下|查查|帮我|哪个|哪家|哪些|有卖|买得到|可以买|里的|里|下|的|内容|信息)/gi,
+      " "
+    )
+    .replace(/(有没有|有无|卖不卖|如果有|有的话|的话|这个)/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return cleanupRetailProductText(cleaned) || "product";
+}
+
+function cleanupRetailProductText(text) {
+  return String(text || "")
+    .replace(/^(没有|有无|有没有|卖不卖)/, "")
+    .replace(/(这个)?商品$/, "")
+    .replace(/^[，,。:!?？\s]+|[，,。:!?？\s]+$/g, "")
+    .trim();
+}
+
+function extractRetailLocation(input) {
+  if (/(münchen|muenchen|munich|慕尼黑)/i.test(input)) {
+    return "Munich, Germany";
+  }
+
+  return "Munich, Germany";
+}
+
+function extractRetailLookupType(input) {
+  const asksPrice = /(price|cost|how much|价格|多少钱|多少)/i.test(input);
+  const asksAvailability = /(availability|available|in stock|stock|有货|库存|有没有|有无|卖不卖|有卖|买得到|可以买)/i.test(input);
+
+  if (asksPrice && asksAvailability) {
+    return "price_and_availability";
+  }
+
+  if (asksPrice) {
+    return "price";
+  }
+
+  if (asksAvailability) {
+    return "availability";
+  }
+
+  return "product_info";
+}
+
+function extractRetailDate(input) {
+  return /(today|今天|current|当前|now|现在)/i.test(input)
+    ? new Date().toISOString().slice(0, 10)
+    : null;
+}
+
+function extractOfferPeriod(input) {
+  if (/(today|今天)/i.test(input)) {
+    return "today";
+  }
+
+  if (/(week|weekly|本周|这周|近期|最近|current|当前|now|现在)/i.test(input)) {
+    return "current_week";
+  }
+
+  return "current_week";
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 function looksLikeProfileRequest(input) {
   return /(profile|profil|账户|账号|个人|余额|预算|资产|财务状况|account|balance|budget)/i.test(input);
+}
+
+function looksLikeProfileUpdateRequest(input) {
+  const hasUpdateVerb = /(change|set|update|edit|modify|rename|改|修改|设置|设为|改成|更新|编辑|叫|名字是|收入是|预算是|余额是)/i.test(
+    input
+  );
+  const hasProfileField = /(name|income|salary|budget|balance|currency|saving|savings|goal|名字|姓名|收入|工资|月收入|预算|月预算|余额|货币|币种|储蓄|存款|目标)/i.test(
+    input
+  );
+
+  return hasUpdateVerb && hasProfileField;
+}
+
+function extractProfileUpdateArgs(input) {
+  return {
+    name: extractProfileName(input),
+    baseCurrency: extractProfileBaseCurrency(input),
+    currentBalance: extractProfileMoneyField(input, [
+      /(?:balance|current balance)\s*(?:is|to|:)?\s*(?:€|eur|euro|euros|欧元?|美元?|\$|cny|rmb|人民币|¥)?\s*(\d+(?:[.,]\d{1,2})?)/i,
+      /(?:余额|当前余额)(?:改成|改为|设置为|设为|是|为|:)?\s*(?:€|eur|euro|euros|欧元?|美元?|\$|cny|rmb|人民币|¥)?\s*(\d+(?:[.,]\d{1,2})?)/i
+    ]),
+    monthlyIncome: extractProfileMoneyField(input, [
+      /(?:monthly income|income|salary)\s*(?:is|to|:)?\s*(?:€|eur|euro|euros|欧元?|美元?|\$|cny|rmb|人民币|¥)?\s*(\d+(?:[.,]\d{1,2})?)/i,
+      /(?:月收入|收入|工资)(?:改成|改为|设置为|设为|是|为|:)?\s*(?:€|eur|euro|euros|欧元?|美元?|\$|cny|rmb|人民币|¥)?\s*(\d+(?:[.,]\d{1,2})?)/i
+    ]),
+    monthlyBudget: extractProfileMoneyField(input, [
+      /(?:monthly budget|budget)\s*(?:is|to|:)?\s*(?:€|eur|euro|euros|欧元?|美元?|\$|cny|rmb|人民币|¥)?\s*(\d+(?:[.,]\d{1,2})?)/i,
+      /(?:月预算|预算)(?:改成|改为|设置为|设为|是|为|:)?\s*(?:€|eur|euro|euros|欧元?|美元?|\$|cny|rmb|人民币|¥)?\s*(\d+(?:[.,]\d{1,2})?)/i
+    ]),
+    savingsGoalName: extractSavingsGoalName(input),
+    savingsGoalTargetAmount: extractProfileMoneyField(input, [
+      /(?:savings goal target|saving goal target|goal target)\s*(?:is|to|:)?\s*(?:€|eur|euro|euros|欧元?|美元?|\$|cny|rmb|人民币|¥)?\s*(\d+(?:[.,]\d{1,2})?)/i,
+      /(?:储蓄目标|存款目标|目标金额)(?:改成|改为|设置为|设为|是|为|:)?\s*(?:€|eur|euro|euros|欧元?|美元?|\$|cny|rmb|人民币|¥)?\s*(\d+(?:[.,]\d{1,2})?)/i
+    ]),
+    savingsGoalSavedAmount: extractProfileMoneyField(input, [
+      /(?:saved amount|already saved|savings saved)\s*(?:is|to|:)?\s*(?:€|eur|euro|euros|欧元?|美元?|\$|cny|rmb|人民币|¥)?\s*(\d+(?:[.,]\d{1,2})?)/i,
+      /(?:已存|已经存了|已储蓄|已攒)(?:金额)?(?:改成|改为|设置为|设为|是|为|:)?\s*(?:€|eur|euro|euros|欧元?|美元?|\$|cny|rmb|人民币|¥)?\s*(\d+(?:[.,]\d{1,2})?)/i
+    ])
+  };
+}
+
+function extractProfileName(input) {
+  const patterns = [
+    /(?:my name|name)\s*(?:is|to|:)\s*([^,.，。!?？]+)$/i,
+    /(?:rename me to|call me)\s+([^,.，。!?？]+)$/i,
+    /(?:名字|姓名)(?:改成|改为|设置为|设为|是|叫|为|:)\s*([^，。,.!?？]+)$/i,
+    /(?:把我(?:的)?名字)(?:改成|改为|设置为|设为|叫)\s*([^，。,.!?？]+)$/i
+  ];
+
+  for (const pattern of patterns) {
+    const match = input.match(pattern);
+
+    if (match?.[1]) {
+      return cleanupProfileText(match[1]);
+    }
+  }
+
+  return null;
+}
+
+function extractProfileBaseCurrency(input) {
+  if (!/(base currency|default currency|currency|默认货币|基础货币|币种|货币)/i.test(input)) {
+    return null;
+  }
+
+  return extractCurrency(input);
+}
+
+function extractSavingsGoalName(input) {
+  const patterns = [
+    /(?:savings goal|saving goal|goal name)\s*(?:is|to|:)\s*([^,.，。!?？]+)$/i,
+    /(?:储蓄目标|存款目标|攒钱目标)(?:名字)?(?:改成|改为|设置为|设为|是|为|:)\s*([^，。,.!?？]+)$/i
+  ];
+
+  for (const pattern of patterns) {
+    const match = input.match(pattern);
+
+    if (match?.[1] && !/\d/.test(match[1])) {
+      return cleanupProfileText(match[1]);
+    }
+  }
+
+  return null;
+}
+
+function extractProfileMoneyField(input, patterns) {
+  for (const pattern of patterns) {
+    const match = input.match(pattern);
+
+    if (match?.[1]) {
+      return Number.parseFloat(match[1].replace(",", "."));
+    }
+  }
+
+  return null;
+}
+
+function cleanupProfileText(value) {
+  return String(value || "")
+    .replace(/^(to|为|成|叫)\s*/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function looksLikeSummaryRequest(input) {
@@ -363,6 +1135,39 @@ function looksLikeListRequest(input) {
 
 function looksLikeExpenseRequest(input) {
   return /(记录|记一笔|支出|花了|消费|买了|spent|expense|paid|cost|lunch|coffee|dinner|breakfast|午饭|午餐|晚饭|早餐|咖啡)/i.test(input);
+}
+
+function looksLikeEmailRequest(input) {
+  return /(send|email|mail|发邮件|邮件|发送邮件|寄邮件)/i.test(input);
+}
+
+function looksLikeSendFinalAnswerEmailRequest(input) {
+  const asksForEmail = looksLikeEmailRequest(input) || /(发到.*邮箱|发给我)/i.test(input);
+  const explicitFinalAnswerEmailRequest =
+    /(send|email|mail|发邮件|邮件|发送邮件|寄邮件|发到.*邮箱|发给我).*(answer|result|summary|final|report|答案|结果|总结|回复|内容)|把.*(answer|result|summary|final|report|答案|结果|总结|回复|内容).*(send|email|mail|发邮件|邮件|发送邮件|寄邮件|发给我|发到.*邮箱)/i.test(
+      input
+    );
+  const asksForInformationThenEmail =
+    asksForEmail &&
+    (looksLikeSummaryRequest(input) ||
+      looksLikeOverviewRequest(input) ||
+      looksLikeRetailOfferRequest(input) ||
+      looksLikeRetailLookupRequest(input) ||
+      looksLikeLocalDealRequest(input));
+
+  return explicitFinalAnswerEmailRequest || asksForInformationThenEmail;
+}
+
+function buildFinalAnswerEmailSubject(input) {
+  if (/(discount|deal|offer|angebote|打折|折扣|优惠|促销)/i.test(input)) {
+    return "Retail offers lookup result";
+  }
+
+  if (/(肉松|pork floss|rousong|商品|price|availability|价格|库存|有卖)/i.test(input)) {
+    return "Retail product lookup result";
+  }
+
+  return "Financial App result";
 }
 
 function extractCategory(input) {
@@ -407,6 +1212,14 @@ function extractSpecificCategory(input) {
 }
 
 function extractNote(input, category) {
+  const knownMerchant = extractKnownMerchantName(input);
+
+  if (knownMerchant) {
+    const productContext = extractPurchasedItemText(input) || extractLocalDealProductQuery(input);
+
+    return [knownMerchant, productContext].filter(Boolean).join(" ").trim();
+  }
+
   if (/(午饭|午餐|lunch)/i.test(input)) {
     return "lunch";
   }
@@ -424,6 +1237,29 @@ function extractNote(input, category) {
   }
 
   return category;
+}
+
+function extractPurchasedItemText(input) {
+  const patterns = [
+    /(?:买了|购买了|点了|吃了|消费了)\s*(.+?)(?:[。.!?？]|$)/i,
+    /(?:bought|purchased|ordered|paid for)\s+(.+?)(?:[。.!?？]|$)/i
+  ];
+
+  for (const pattern of patterns) {
+    const match = input.match(pattern);
+
+    if (match?.[1]) {
+      const cleaned = match[1]
+        .replace(/\d+(?:[.,]\d{1,2})?\s*(?:块钱的?|块的?|元的?|欧元的?|欧的?|eur|euro|euros|€|cny|rmb|人民币|¥)?/gi, " ")
+        .replace(/^(的|了)\s*/, "")
+        .replace(/\s+/g, " ")
+        .trim();
+
+      return cleanupLocalDealText(cleaned) || null;
+    }
+  }
+
+  return null;
 }
 
 function extractPriority(input) {
